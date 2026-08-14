@@ -9,4 +9,7 @@ test('skill teaches the controlled schema-change workflow', async () => {
   }
   assert.match(skill, /MySQL DDL auto-commits/i)
   assert.match(skill, /never invent.*backup/i)
+  assert.match(skill, /sakura-db permissions/)
+  assert.match(skill, /sakura-db-mcp/)
+  assert.doesNotMatch(skill, /npm run db-agent/)
 })

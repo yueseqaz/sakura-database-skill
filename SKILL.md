@@ -31,15 +31,15 @@ For a structure change, call `database_permissions`, then preview the structured
 ```
 
 ```bash
-npm run db-agent -- discover --table orders
-npm run db-agent -- summary --table orders
-npm run db-agent -- plan --file plan.json --profile development
-npm run db-agent -- assess --file plan.json
-npm run db-agent -- explain --file plan.json
-npm run db-agent -- mutate --file mutation.json --profile writer
-npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key <task-key>
-npm run db-agent -- permissions --profile admin
-npm run db-agent -- schema --file schema.json --profile admin
+sakura-db discover --table orders
+sakura-db summary --table orders
+sakura-db plan --file plan.json --profile development
+sakura-db assess --file plan.json --profile development
+sakura-db explain --file plan.json --profile development
+sakura-db mutate --file mutation.json --profile writer
+sakura-db mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key <task-key>
+sakura-db permissions --profile admin
+sakura-db schema --file schema.json --profile admin
 ```
 
 ## Profiles And Security
@@ -59,4 +59,4 @@ npm run db-agent -- schema --file schema.json --profile admin
 
 ## MCP
 
-Run `npm run mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.
+Run `sakura-db-mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.

@@ -37,10 +37,13 @@ flowchart TD
 ## Install
 
 ```bash
-npm install
-npm run db-agent -- --help
-npm run db-agent -- doctor
+npm install -g sakura-database-skill
+sakura-db --help
+sakura-db doctor
+sakura-db-mcp
 ```
+
+For repository development, use `npm install` and the `npm run db-agent -- <command>` / `npm run mcp` scripts instead.
 
 ## Quick start
 
