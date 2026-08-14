@@ -7,6 +7,7 @@ export interface SelectPlan {
   where?: Array<{ column: string; op: QueryOperator; value: unknown }>
   orderBy?: Array<{ column: string; direction?: 'asc' | 'desc' }>
   limit?: number
+  offset?: number
 }
 
 export interface Policy {
@@ -32,6 +33,7 @@ export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRow
   if (!Array.isArray(plan.columns) || plan.columns.length === 0) throw new Error('Select plans require at least one column.')
   const maxRows = Math.max(1, Math.min(policy.maxRows ?? 100, 10_000))
   const limit = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
+  const offset = Math.max(0, plan.offset ?? 0)
   const parameters: unknown[] = []
   let placeholder = 0
   const bind = (value: unknown) => {
@@ -58,8 +60,9 @@ export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRow
   })
 
   const limitPlaceholder = bind(limit)
+  const offsetClause = offset > 0 ? ` offset ${bind(offset)}` : ''
   return {
-    sql: `select ${plan.columns.map((column) => identifier(column, dialect)).join(', ')} from ${identifier(plan.table, dialect)}${predicates.length ? ` where ${predicates.join(' and ')}` : ''}${orderBy.length ? ` order by ${orderBy.join(', ')}` : ''} limit ${limitPlaceholder}`,
+    sql: `select ${plan.columns.map((column) => identifier(column, dialect)).join(', ')} from ${identifier(plan.table, dialect)}${predicates.length ? ` where ${predicates.join(' and ')}` : ''}${orderBy.length ? ` order by ${orderBy.join(', ')}` : ''} limit ${limitPlaceholder}${offsetClause}`,
     parameters,
   }
 }

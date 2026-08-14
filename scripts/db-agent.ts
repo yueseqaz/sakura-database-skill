@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
-import { compileSelectPlan, maskRows, safeStatement, type SelectPlan, validatePolicy } from './core.js'
+import { compileSelectPlan, makeExplainStatement, maskRows, safeStatement, type SelectPlan, validatePolicy } from './core.js'
 import { defaultAuditPath, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
 import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
+import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 
-type Command = 'discover' | 'query' | 'plan' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'migrate' | 'backup' | 'restore'
+type Command = 'discover' | 'summary' | 'assess' | 'query' | 'plan' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config'
 type OutputFormat = 'json' | 'table' | 'csv'
 
 interface Args {
@@ -36,7 +37,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   const help = command === '--help' || command === '-h' || values.help === true
-  if (command && !['discover', 'query', 'plan', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'migrate', 'backup', 'restore', '--help', '-h'].includes(command)) {
+  if (command && !['discover', 'summary', 'assess', 'query', 'plan', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', '--help', '-h'].includes(command)) {
     throw new Error(`Unknown command: ${command}`)
   }
   return { command: command as Command | undefined, values, positionals, help }
@@ -49,6 +50,8 @@ Read-only commands:
   health                         Check connectivity.
   stats                          Summarize tables and estimated storage.
   discover [--table name]        Discover tables and columns.
+  summary [--table name]         Summarize table and sensitive-column counts.
+  assess --sql <statement>       Explain and rate read-query cost.
   query --sql <statement>        Run one limited read-only statement.
   plan --file <plan.json>        Run a parameterized SelectPlan.
   explain --sql <statement>      Inspect a read-only query plan.
@@ -58,11 +61,6 @@ Read-only commands:
 Configuration:
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
-
-Guarded previews (no database changes):
-  migrate --file <migration.sql> [--approve token]
-  backup --destination <path> [--approve token]
-  restore --source <path> [--approve token]
 
 Common options: --profile name --config path --approve token --format json|table|csv
 Environment: DB_DIALECT=postgres|mysql|sqlite DATABASE_URL=<connection URL>`)
@@ -74,12 +72,16 @@ function stringValue(values: Args['values'], name: string): string | undefined {
 }
 
 function output(value: unknown, format: OutputFormat = 'json'): void {
-  if (format === 'table' && Array.isArray(value)) {
-    console.table(value)
+  const rows = Array.isArray(value)
+    ? value as Array<Record<string, unknown>>
+    : value && typeof value === 'object' && Array.isArray((value as { rows?: unknown }).rows)
+      ? (value as { rows: Array<Record<string, unknown>> }).rows
+      : undefined
+  if (format === 'table' && rows) {
+    console.table(rows)
     return
   }
-  if (format === 'csv' && Array.isArray(value)) {
-    const rows = value as Array<Record<string, unknown>>
+  if (format === 'csv' && rows) {
     const headers = [...new Set(rows.flatMap((row) => Object.keys(row)))]
     const escape = (item: unknown) => `"${String(item ?? '').replaceAll('"', '""')}"`
     console.log([headers, ...rows.map((row) => headers.map((header) => row[header]))].map((row) => row.map(escape).join(',')).join('\n'))
@@ -88,16 +90,13 @@ function output(value: unknown, format: OutputFormat = 'json'): void {
   console.log(JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item, 2))
 }
 
+function schemaTables(entries: Awaited<ReturnType<typeof discover>>): SchemaTable[] {
+  return entries.map((table) => ({ name: table.name, columns: table.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) }))
+}
+
 function assertRawQueryIsBounded(statement: string): void {
   if (/\b(count|sum|avg|min|max)\s*\(/i.test(statement)) return
   if (!/\blimit\s+\d+/i.test(statement)) throw new Error('Raw queries must include LIMIT. Use a SelectPlan to receive an automatic cap.')
-}
-
-async function preview(command: 'migrate' | 'backup' | 'restore', args: Args, policy: Parameters<typeof validatePolicy>[0]): Promise<void> {
-  validatePolicy(policy, { action: command, approvalToken: stringValue(args.values, 'approve') })
-  const target = stringValue(args.values, command === 'restore' ? 'source' : command === 'backup' ? 'destination' : 'file')
-  if (!target) throw new Error(`${command} requires --${command === 'restore' ? 'source' : command === 'backup' ? 'destination' : 'file'}.`)
-  output({ action: command, mode: 'preview', target, sideEffects: false, nextStep: 'Route this approved plan to a dedicated executor; this CLI never performs it.' })
 }
 
 async function run(): Promise<void> {
@@ -128,10 +127,6 @@ async function run(): Promise<void> {
   const resolvedProfile = resolveProfile(config, stringValue(args.values, 'profile'))
   const profile: Profile = resolvedProfile?.profile ?? { dialect: process.env.DB_DIALECT as Profile['dialect'] }
 
-  if (args.command === 'migrate' || args.command === 'backup' || args.command === 'restore') {
-    return preview(args.command, args, profile)
-  }
-
   const { dialect, url } = resolveConnection(resolvedProfile?.profile)
   validatePolicy(profile, { action: args.command, approvalToken: stringValue(args.values, 'approve') })
 
@@ -146,6 +141,15 @@ async function run(): Promise<void> {
     if (args.command === 'health') result = { ...(await executeWithTimeout(health(db), profile.timeoutMs)), dialect }
     else if (args.command === 'stats') result = await executeWithTimeout(statistics(db, dialect), profile.timeoutMs)
     else if (args.command === 'discover') result = await executeWithTimeout(discover(db, stringValue(args.values, 'table')), profile.timeoutMs)
+    else if (args.command === 'summary') {
+      const tables = schemaTables(await executeWithTimeout(discover(db, stringValue(args.values, 'table')), profile.timeoutMs))
+      result = summarizeSchema(tables)
+    } else if (args.command === 'assess') {
+      const source = stringValue(args.values, 'sql')
+      if (!source) throw new Error('assess requires --sql.')
+      const plan = await executeWithTimeout(query(db, makeExplainStatement(dialect, source)), profile.timeoutMs)
+      result = { assessment: assessExplain(dialect, plan.rows as Array<Record<string, unknown>>), plan: plan.rows }
+    }
     else if (args.command === 'indexes') {
       const table = stringValue(args.values, 'table')
       if (!table) throw new Error('indexes requires --table.')
@@ -160,10 +164,13 @@ async function run(): Promise<void> {
         const plan = JSON.parse(await readFile(file, 'utf8')) as SelectPlan
         compileSelectPlan(plan, profile, dialect)
         action = `plan:${plan.table}`
-        const queryResult = await executeWithTimeout(queryPlan(db, dialect, plan, profile), profile.timeoutMs)
-        rowCount = queryResult.rows.length
-        const rows = args.values['include-sensitive'] === true ? queryResult.rows : maskRows(queryResult.rows as Array<Record<string, unknown>>, profile.sensitiveColumns)
-        result = { rows, rowCount }
+        const pageSize = Math.max(1, Math.min(plan.limit ?? profile.maxRows ?? 100, profile.maxRows ?? 100))
+        const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize }, { ...profile, fetchExtra: true }), profile.timeoutMs)
+        const pagination = paginatePlan({ ...plan, limit: pageSize }, queryResult.rows.length)
+        const pageRows = queryResult.rows.slice(0, pagination.returned)
+        rowCount = pageRows.length
+        const rows = args.values['include-sensitive'] === true ? pageRows : maskRows(pageRows as Array<Record<string, unknown>>, profile.sensitiveColumns)
+        result = { rows, rowCount, page: pagination }
         await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount }, auditPath)
         output(result, format)
         return
@@ -172,6 +179,13 @@ async function run(): Promise<void> {
         if (!source) throw new Error(`${args.command} requires --sql.`)
         statement = safeStatement(source)
         if (args.command === 'query') assertRawQueryIsBounded(statement)
+        if (args.command === 'query' && args.values.check === true) {
+          const explainResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), profile.timeoutMs)
+          const assessment = assessExplain(dialect, explainResult.rows as Array<Record<string, unknown>>)
+          if (assessment.requiresApproval && args.values['allow-scan'] !== true) {
+            throw new Error(`Query blocked: ${assessment.reasons.join(', ')}. Re-run with --allow-scan after review.`)
+          }
+        }
         if (args.command === 'explain' && !/^explain\b/i.test(statement)) statement = dialect === 'sqlite' ? `EXPLAIN QUERY PLAN ${statement}` : `EXPLAIN ${statement}`
       }
       const queryResult = await executeWithTimeout(query(db, statement), profile.timeoutMs)

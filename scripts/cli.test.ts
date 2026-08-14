@@ -25,7 +25,7 @@ test('runs a plan through the CLI, masks results, and emits an audit event', asy
   await writeFile(planPath, JSON.stringify({ table: 'users', columns: ['id', 'email'], where: [{ column: 'status', op: '=', value: 'active' }] }))
   try {
     const { stdout } = await cli(['plan', '--file', planPath, '--audit-log', auditPath], { DB_DIALECT: 'sqlite', DATABASE_URL: `sqlite://${databasePath}` })
-    assert.deepEqual(JSON.parse(stdout), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1 })
+    assert.deepEqual(JSON.parse(stdout), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
     assert.match(await readFile(auditPath, 'utf8'), /plan:users/)
   } finally {
     await rm(directory, { recursive: true, force: true })

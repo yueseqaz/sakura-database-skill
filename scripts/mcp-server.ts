@@ -5,7 +5,8 @@ import { z } from 'zod'
 import { defaultAuditPath, writeAudit } from './audit.js'
 import { loadConfig, resolveConnection, resolveProfile } from './config.js'
 import { maskRows, makeExplainStatement, safeStatement, type SelectPlan, validatePolicy } from './core.js'
-import { connect, discover, executeWithTimeout, health, query, queryPlan, withLocalTunnel } from './database.js'
+import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
+import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 
 const configPath = process.env.DB_AGENT_CONFIG
@@ -71,12 +72,61 @@ server.registerTool('database_discover', {
   } catch (error) { return failure(error) }
 })
 
+server.registerTool('database_stats', {
+  title: 'Database statistics',
+  description: 'Return dialect-appropriate table, row, and storage estimates.',
+  inputSchema: { profile: z.string(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'stats', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(statistics(db, dialect), timeoutMs)))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_indexes', {
+  title: 'Inspect table indexes',
+  description: 'Return indexes reported by the database for one table.',
+  inputSchema: { profile: z.string(), table: z.string(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, table, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'indexes', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(indexes(db, dialect, table), timeoutMs)))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_relations', {
+  title: 'Inspect foreign-key relationships',
+  description: 'Return foreign-key relationships reported by database metadata.',
+  inputSchema: { profile: z.string(), table: z.string().optional(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, table, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'relations', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(relationships(db, dialect, table), timeoutMs)))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_summary', {
+  title: 'Summarize database schema',
+  description: 'Return compact table, column, and sensitive-field counts from observed schema metadata.',
+  inputSchema: { profile: z.string(), table: z.string().optional(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, table, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'summary', approvalToken, async ({ db, timeoutMs }) => {
+      const discovered = await executeWithTimeout(discover(db, table), timeoutMs)
+      const schema = discovered.map((entry) => ({ name: entry.name, columns: entry.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) })) as SchemaTable[]
+      return summarizeSchema(schema)
+    }))
+  } catch (error) { return failure(error) }
+})
+
 const planSchema = z.object({
   table: z.string(),
   columns: z.array(z.string()).min(1),
   where: z.array(z.object({ column: z.string(), op: z.enum(['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in']), value: z.unknown() })).optional(),
   orderBy: z.array(z.object({ column: z.string(), direction: z.enum(['asc', 'desc']).optional() })).optional(),
   limit: z.number().int().positive().optional(),
+  offset: z.number().int().nonnegative().optional(),
 })
 
 server.registerTool('database_query_plan', {
@@ -87,8 +137,11 @@ server.registerTool('database_query_plan', {
 }, async ({ profile, plan, includeSensitive, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'plan', approvalToken, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns }) => {
-      const queryResult = await executeWithTimeout(queryPlan(db, dialect, plan as SelectPlan, { maxRows }), timeoutMs)
-      return { rows: includeSensitive ? queryResult.rows : maskRows(queryResult.rows as Array<Record<string, unknown>>, sensitiveColumns), rowCount: queryResult.rows.length }
+      const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows ?? 100, maxRows ?? 100))
+      const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize } as SelectPlan, { maxRows, fetchExtra: true }), timeoutMs)
+      const page = paginatePlan({ ...plan, limit: pageSize } as SelectPlan, queryResult.rows.length)
+      const rows = queryResult.rows.slice(0, page.returned)
+      return { rows: includeSensitive ? rows : maskRows(rows as Array<Record<string, unknown>>, sensitiveColumns), rowCount: rows.length, page }
     }))
   } catch (error) { return failure(error) }
 })
@@ -103,6 +156,20 @@ server.registerTool('database_explain', {
     return result(await withProfile(profile, 'explain', approvalToken, async ({ db, dialect, timeoutMs }) => {
       const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, safeStatement(statement))), timeoutMs)
       return { rows: queryResult.rows, rowCount: queryResult.rows.length }
+    }))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_assess', {
+  title: 'Assess query cost',
+  description: 'Explain a read-only query and return a low, medium, or high risk assessment.',
+  inputSchema: { profile: z.string(), sql: z.string(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, sql: statement, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs }) => {
+      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, safeStatement(statement))), timeoutMs)
+      return { assessment: assessExplain(dialect, queryResult.rows as Array<Record<string, unknown>>), plan: queryResult.rows }
     }))
   } catch (error) { return failure(error) }
 })

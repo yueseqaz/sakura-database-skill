@@ -100,10 +100,12 @@ function quotedIdentifier(value: string, dialect: DialectName): string {
   return `${quote}${value}${quote}`
 }
 
-export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: SelectPlan, policy: Pick<Policy, 'maxRows'>) {
+export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: SelectPlan, policy: Pick<Policy, 'maxRows'> & { fetchExtra?: boolean }) {
   if (plan.columns.length === 0) throw new Error('Select plans require at least one column.')
   const maxRows = Math.max(1, Math.min(policy.maxRows ?? 100, 10_000))
-  const limit = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
+  const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
+  const limit = pageSize + (policy.fetchExtra ? 1 : 0)
+  const offset = Math.max(0, plan.offset ?? 0)
   const columns = sql.join(plan.columns.map((column) => sql.raw(quotedIdentifier(column, dialect))), sql.raw(', '))
   const predicates = (plan.where ?? []).map(({ column, op, value }) => {
     const normalized = op.toLowerCase()
@@ -121,7 +123,8 @@ export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: 
   })
   const where = predicates.length ? sql` where ${sql.join(predicates, sql.raw(' and '))}` : sql``
   const ordering = orderBy.length ? sql` order by ${sql.join(orderBy, sql.raw(', '))}` : sql``
-  return sql`select ${columns} from ${sql.raw(quotedIdentifier(plan.table, dialect))}${where}${ordering} limit ${sql.val(limit)}`.execute(db)
+  const pagination = offset > 0 ? sql` limit ${sql.val(limit)} offset ${sql.val(offset)}` : sql` limit ${sql.val(limit)}`
+  return sql`select ${columns} from ${sql.raw(quotedIdentifier(plan.table, dialect))}${where}${ordering}${pagination}`.execute(db)
 }
 
 export async function indexes(db: DatabaseClient, dialect: DialectName, table: string) {

@@ -23,13 +23,27 @@ test('MCP server exposes and runs read-only database tools', async () => {
   try {
     await client.connect(transport)
     const tools = await client.listTools()
-    assert.ok(tools.tools.some((tool) => tool.name === 'database_query_plan'))
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
+      'database_assess',
+      'database_discover',
+      'database_explain',
+      'database_health',
+      'database_indexes',
+      'database_query_plan',
+      'database_relations',
+      'database_stats',
+      'database_summary',
+    ])
     const response = await client.callTool({ name: 'database_health', arguments: { profile: 'local' } }) as { content: Array<{ text: string }> }
     assert.match(response.content[0].text, /"ok": true/)
     const queryResponse = await client.callTool({ name: 'database_query_plan', arguments: {
       profile: 'local', plan: { table: 'users', columns: ['id', 'email'], limit: 100 },
     } }) as { content: Array<{ text: string }> }
-    assert.deepEqual(JSON.parse(queryResponse.content[0].text), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1 })
+    assert.deepEqual(JSON.parse(queryResponse.content[0].text), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: true, nextOffset: 1 } })
+    const nextPageResponse = await client.callTool({ name: 'database_query_plan', arguments: {
+      profile: 'local', plan: { table: 'users', columns: ['id', 'email'], limit: 1, offset: 1 },
+    } }) as { content: Array<{ text: string }> }
+    assert.deepEqual(JSON.parse(nextPageResponse.content[0].text), { rows: [{ id: 2, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
   } finally {
     await client.close()
     await rm(directory, { recursive: true, force: true })
