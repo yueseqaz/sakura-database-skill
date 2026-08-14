@@ -9,13 +9,13 @@ Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language re
 
 ## Workflow
 
-1. Run `summary` to orient within a large database, then `discover --table <name>` and, when needed, `relations --table <name>` before querying an unfamiliar table.
+1. Run `summary` to orient within a large database, then use paginated `discover --table <name> --limit <n>` and, when needed, `relations --table <name>` before querying an unfamiliar table. Continue with `--cursor <nextCursor>` when returned.
 2. State the selected table, columns, filters, expected row count, and sensitivity before executing.
 3. Convert the user's request into a minimal Query Plan using the observed schema. The CLI does not interpret natural language and has no raw SQL command.
 4. Run `assess --file <plan.json>` before a potentially expensive plan. Check `indexes` when it scans unexpectedly. Honor table, column, and required-filter profile policies.
 5. Return only fields needed for the task. Keep default masking enabled.
 
-For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Execute only after the user approves the preview, using `execute: true` and the supplied approval token. Never invent an approval token.
+For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Preserve its `planFingerprint`. Execute only after the user approves that exact preview, using `execute: true`, the supplied approval token, and `confirmFingerprint`. If the plan or policy changes, preview again. Never invent an approval token or fingerprint.
 
 ```json
 {
@@ -33,13 +33,13 @@ npm run db-agent -- plan --file plan.json --profile development
 npm run db-agent -- assess --file plan.json
 npm run db-agent -- explain --file plan.json
 npm run db-agent -- mutate --file mutation.json --profile writer
-npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint>
 ```
 
 ## Profiles And Security
 
 - Use profiles for remote or production databases. Credentials must be supplied by `urlEnv`, not committed to a profile.
-- Every mutation execution requires `--approve <ticket-or-token>`. Never reuse or invent approval.
+- Every mutation execution requires `--approve <ticket-or-token>` and the exact preview fingerprint through `--confirm`. Never reuse or invent approval.
 - Treat `allowedTables`, `allowedColumns`, `deniedColumns`, and `requiredFilters` as hard boundaries.
 - Use `--include-sensitive` only when the profile sets `allowSensitive: true` and the user explicitly authorizes disclosure.
 - Prefer separate least-privilege read-only and writer profiles. Keep `allowWrites` false unless writes are required; enable `allowDelete` separately and set a small `maxAffectedRows`.
@@ -49,4 +49,4 @@ npm run db-agent -- mutate --file mutation.json --profile writer --execute --app
 
 ## MCP
 
-Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same schema validation, profile policy, limits, approval, transactions, rollback, masking, and audit controls.
+Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. Pass the returned `planFingerprint` as `confirmFingerprint` only after approval. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same paginated/on-demand schema validation, profile policy, limits, structured error codes, approval, transactions, rollback, masking, and audit controls.

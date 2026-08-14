@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { fingerprintStatement, writeAudit } from './audit.js'
-import { connect, discover, explainPlan, queryPlan, statistics, type DatabaseClient } from './database.js'
+import { connect, discover, discoverPage, discoverTables, explainPlan, queryPlan, statistics, type DatabaseClient } from './database.js'
 import { maskRows } from './core.js'
 
 test('rejects non-MySQL database dialects', () => {
@@ -52,6 +52,43 @@ test('explains a structured plan without accepting raw SQL', async () => {
   assert.equal(executed?.statement, 'EXPLAIN select `id` from `users` where `status` = ? limit ?')
   assert.deepEqual(executed?.parameters, ['active', 10])
   assert.deepEqual(result.rows, [{ type: 'ref', rows: 5 }])
+})
+
+test('discovers exact plan tables without scanning the full schema', async () => {
+  const calls: Array<{ statement: string; parameters: unknown[] }> = []
+  const db: DatabaseClient = {
+    async execute(statement, parameters = []) {
+      calls.push({ statement, parameters })
+      return { rows: parameters.map((name) => ({
+        table_schema: 'app', table_name: name, table_type: 'BASE TABLE', column_name: 'id', data_type: 'int', is_nullable: 'NO', extra: '', column_default: null,
+      })) }
+    },
+    async transaction(run) { return run({ execute: db.execute }) },
+    async destroy() {},
+  }
+  const tables = await discoverTables(db, ['users', 'orders'])
+  assert.deepEqual(tables.map((table) => table.name), ['users', 'orders'])
+  assert.match(calls[0].statement, /table_name in \(\?, \?\)/i)
+  assert.deepEqual(calls[0].parameters, ['users', 'orders'])
+})
+
+test('paginates schema discovery with an opaque cursor', async () => {
+  let call = 0
+  const db: DatabaseClient = {
+    async execute(_statement, parameters = []) {
+      call += 1
+      if (call === 1) return { rows: [{ table_name: 'orders' }, { table_name: 'projects' }, { table_name: 'users' }] }
+      return { rows: (parameters as string[]).map((name) => ({
+        table_schema: 'app', table_name: name, table_type: 'BASE TABLE', column_name: 'id', data_type: 'int', is_nullable: 'NO', extra: '', column_default: null,
+      })) }
+    },
+    async transaction(run) { return run({ execute: db.execute }) },
+    async destroy() {},
+  }
+  const page = await discoverPage(db, { limit: 2, cursor: Buffer.from('customers').toString('base64url'), search: 'er' })
+  assert.deepEqual(page.tables.map((table) => table.name), ['orders', 'projects'])
+  assert.equal(page.nextCursor, Buffer.from('projects').toString('base64url'))
+  await assert.rejects(() => discoverPage(db, { limit: Number.NaN }), /integer between 1 and 100/i)
 })
 
 test('writes audit events without query values', async () => {

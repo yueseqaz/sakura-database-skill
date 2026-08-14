@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   compileMutationPlan,
   executeMutation,
+  mutationPlanFingerprint,
   previewMutation,
   validateMutationExecution,
   type MutationPlan,
@@ -51,6 +52,9 @@ test('compiles bounded update and delete plans and previews matching rows', asyn
     operation: 'update', table: 'users', set: { status: 'disabled' }, where: { column: 'tenant_id', op: '=', value: 7 },
   }, { allowWrites: true, maxAffectedRows: 2 }), {
     operation: 'update', table: 'users', estimatedRows: 3, maximumAffectedRows: 2, exceedsLimit: true,
+    planFingerprint: mutationPlanFingerprint('default', {
+      operation: 'update', table: 'users', set: { status: 'disabled' }, where: { column: 'tenant_id', op: '=', value: 7 },
+    }, { allowWrites: true, maxAffectedRows: 2 }),
   })
 })
 
@@ -59,7 +63,20 @@ test('enforces write, delete, column, and approval policies', () => {
   assert.throws(() => compileMutationPlan({ operation: 'delete', table: 'users', where: { column: 'id', op: '=', value: 1 } }, { allowWrites: true }), /allowDelete/)
   assert.throws(() => compileMutationPlan({ operation: 'update', table: 'users', set: { role: 'admin' }, where: { column: 'id', op: '=', value: 1 } }, { allowWrites: true, deniedColumns: { users: ['role'] } }), /denied/)
   assert.throws(() => validateMutationExecution({ allowWrites: true }, true, undefined), /approval token/)
-  assert.doesNotThrow(() => validateMutationExecution({ allowWrites: true }, true, 'ticket-42'))
+  assert.doesNotThrow(() => validateMutationExecution({ allowWrites: true }, true, 'ticket-42', 'fingerprint', 'fingerprint'))
+})
+
+test('binds mutation execution to a stable preview fingerprint', () => {
+  const first = { operation: 'update', table: 'users', set: { status: 'disabled', name: 'Ada' }, where: { column: 'tenant_id', op: '=', value: 7 } } as const
+  const reordered = { operation: 'update', table: 'users', set: { name: 'Ada', status: 'disabled' }, where: { value: 7, op: '=', column: 'tenant_id' } } as const
+  const policy = { allowWrites: true, maxAffectedRows: 2, allowedTables: ['users'] }
+  const fingerprint = mutationPlanFingerprint('writer', first, policy)
+  assert.equal(fingerprint, mutationPlanFingerprint('writer', reordered, policy))
+  assert.notEqual(fingerprint, mutationPlanFingerprint('writer', { ...first, set: { ...first.set, status: 'active' } }, policy))
+  assert.notEqual(fingerprint, mutationPlanFingerprint('writer', first, { ...policy, maxAffectedRows: 3 }))
+  assert.throws(() => validateMutationExecution(policy, true, 'ticket-42', undefined, fingerprint), /fingerprint/i)
+  assert.throws(() => validateMutationExecution(policy, true, 'ticket-42', 'wrong', fingerprint), /fingerprint/i)
+  assert.doesNotThrow(() => validateMutationExecution(policy, true, 'ticket-42', fingerprint, fingerprint))
 })
 
 test('rolls back when a mutation exceeds the affected-row limit', async () => {
@@ -82,9 +99,11 @@ test('rolls back when a mutation exceeds the affected-row limit', async () => {
     },
     async destroy() {},
   }
-  await assert.rejects(() => executeMutation(db, {
+  const plan = {
     operation: 'update', table: 'users', set: { status: 'disabled' }, where: { column: 'tenant_id', op: '=', value: 7 },
-  }, { allowWrites: true, maxAffectedRows: 2 }, 'ticket-42'), /affected-row limit/)
+  } as const
+  const policy = { allowWrites: true, maxAffectedRows: 2 }
+  await assert.rejects(() => executeMutation(db, plan, policy, 'ticket-42', mutationPlanFingerprint('default', plan, policy)), /affected-row limit/)
   assert.equal(committed, false)
   assert.equal(rolledBack, true)
 })

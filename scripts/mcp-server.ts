@@ -6,9 +6,10 @@ import { defaultAuditPath, writeAudit } from './audit.js'
 import { loadConfig, resolveConnection, resolveProfile } from './config.js'
 import { maskRows, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
-import { connect, discover, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
+import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
-import { executeMutation, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
+import { executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
+import { errorPayload } from './errors.js'
 
 const configPath = process.env.DB_AGENT_CONFIG
 
@@ -17,7 +18,7 @@ function result(value: unknown) {
 }
 
 function failure(error: unknown) {
-  return { content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }], isError: true }
+  return { content: [{ type: 'text' as const, text: JSON.stringify(errorPayload(error), null, 2) }], isError: true }
 }
 
 function auditedRowCount(value: unknown): number | undefined {
@@ -48,7 +49,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
     await writeAudit({ action, profile: profileName, dialect, success: true, rowCount: auditedRowCount(value) }, resolved.profile.auditLog ?? defaultAuditPath())
     return value
   } catch (error) {
-    await writeAudit({ action, profile: profileName, dialect, success: false, error: error instanceof Error ? error.message : String(error) }, resolved.profile.auditLog ?? defaultAuditPath())
+    await writeAudit({ action, profile: profileName, dialect, success: false, error: JSON.stringify(errorPayload(error).error) }, resolved.profile.auditLog ?? defaultAuditPath())
     throw error
   } finally {
     await db.destroy()
@@ -56,7 +57,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.5.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.6.0' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
@@ -74,11 +75,11 @@ server.registerTool('database_health', {
 server.registerTool('database_discover', {
   title: 'Discover database schema',
   description: 'List database tables and columns. Optionally filter by table name.',
-  inputSchema: { profile: z.string(), table: z.string().optional(), approvalToken: z.string().optional() },
+  inputSchema: { profile: z.string(), table: z.string().optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional(), approvalToken: z.string().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, table, approvalToken }) => {
+}, async ({ profile, table, limit, cursor, approvalToken }) => {
   try {
-    return result(await withProfile(profile, 'discover', approvalToken, ({ db, timeoutMs }) => executeWithTimeout(discover(db, table), timeoutMs)))
+    return result(await withProfile(profile, 'discover', approvalToken, ({ db, timeoutMs }) => executeWithTimeout(discoverPage(db, { search: table, limit, cursor }), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
@@ -123,7 +124,7 @@ server.registerTool('database_summary', {
 }, async ({ profile, table, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'summary', approvalToken, async ({ db, timeoutMs }) => {
-      const discovered = await executeWithTimeout(discover(db, table), timeoutMs)
+      const discovered = (await executeWithTimeout(discoverPage(db, { search: table }), timeoutMs)).tables
       const schema = discovered.map((entry) => ({ name: entry.name, columns: entry.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) })) as SchemaTable[]
       return summarizeSchema(schema)
     }))
@@ -187,7 +188,7 @@ server.registerTool('database_query_plan', {
   try {
     return result(await withProfile(profile, 'plan', approvalToken, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns, allowSensitive, policy }) => {
       validateSensitiveAccess({ allowSensitive }, includeSensitive === true)
-      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
       const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows ?? 100, maxRows ?? 100))
       const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize } as SelectPlan, { maxRows, fetchExtra: true }), timeoutMs)
@@ -201,18 +202,18 @@ server.registerTool('database_query_plan', {
 server.registerTool('database_mutation_plan', {
   title: 'Preview or execute a safe mutation plan',
   description: 'Preview a structured InsertPlan, UpdatePlan, or DeletePlan by default. Execution requires profile write permission and an approval token.',
-  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional() },
+  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(), confirmFingerprint: z.string().optional() },
   annotations: { readOnlyHint: false, destructiveHint: true },
-}, async ({ profile, plan, execute, approvalToken }) => {
+}, async ({ profile, plan, execute, approvalToken, confirmFingerprint }) => {
   try {
     return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`, approvalToken, async ({ db, timeoutMs, policy }) => {
-      validateMutationExecution(policy, execute === true, approvalToken)
-      validateMutationSchema(plan as MutationPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validateMutationExecution(policy, execute === true, approvalToken, confirmFingerprint, mutationPlanFingerprint(profile, plan as MutationPlan, policy))
+      validateMutationSchema(plan as MutationPlan, await executeWithTimeout(discoverTables(db, [plan.table]), timeoutMs))
       if (execute === true) {
-        const mutation = await executeWithTimeout(executeMutation(db, plan as MutationPlan, policy, approvalToken), timeoutMs)
+        const mutation = await executeWithTimeout(executeMutation(db, plan as MutationPlan, policy, approvalToken, confirmFingerprint, profile), timeoutMs)
         return { mode: 'executed', ...mutation }
       }
-      return { mode: 'preview', ...(await executeWithTimeout(previewMutation(db, plan as MutationPlan, policy), timeoutMs)) }
+      return { mode: 'preview', ...(await executeWithTimeout(previewMutation(db, plan as MutationPlan, policy, profile), timeoutMs)) }
     }))
   } catch (error) { return failure(error) }
 })
@@ -225,7 +226,7 @@ server.registerTool('database_explain', {
 }, async ({ profile, plan, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'explain', approvalToken, async ({ db, timeoutMs, policy }) => {
-      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
       const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)
       return { rows: queryResult.rows, rowCount: queryResult.rows.length }
@@ -241,7 +242,7 @@ server.registerTool('database_assess', {
 }, async ({ profile, plan, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs, policy }) => {
-      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
       const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)
       return { assessment: assessExplain(dialect, queryResult.rows, policy.maxEstimatedRows), plan: queryResult.rows }

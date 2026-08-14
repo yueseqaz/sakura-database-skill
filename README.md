@@ -49,7 +49,7 @@ export DATABASE_URL='mysql://readonly:password@localhost:3306/app'
 
 npm run db-agent -- health
 npm run db-agent -- stats
-npm run db-agent -- discover --table orders
+npm run db-agent -- discover --table orders --limit 50
 npm run db-agent -- summary --table orders
 npm run db-agent -- indexes --table orders
 npm run db-agent -- relations --table orders
@@ -85,7 +85,9 @@ Then execute it:
 npm run db-agent -- plan --file plan.json
 ```
 
-The CLI validates identifiers and operators, verifies tables and columns against the observed schema, binds values through mysql2, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. `--include-sensitive` also requires `allowSensitive: true` in the selected profile.
+The CLI validates identifiers and operators, verifies only the plan's referenced tables and columns against the observed schema, binds values through mysql2, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. `--include-sensitive` also requires `allowSensitive: true` in the selected profile.
+
+Schema discovery is paginated. `discover` returns `tables` and an opaque `nextCursor`; pass that cursor back with `--cursor` to continue. A page contains at most 100 tables, while plan validation fetches only the exact base, joined, or mutation target tables.
 
 Query Plans also support nested `and`/`or` filters, `is null`, `is not null`, `between`, `not in`, controlled inner and left joins, `count`/`sum`/`avg`/`min`/`max`, grouping, and `having`. There is no arbitrary SQL execution path.
 
@@ -104,10 +106,10 @@ Use one structured Mutation Plan for insert, update, or delete. Preview is the d
 
 ```bash
 npm run db-agent -- mutate --file mutation.json --profile writer
-npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint>
 ```
 
-The profile must set `allowWrites: true`. Every execution requires an approval token. Update and delete require non-empty filters, are limited by `maxAffectedRows`, and roll back if the actual affected row count exceeds that limit. Delete additionally requires `allowDelete: true`. Existing table, column, and required-filter policies apply to mutations.
+The preview returns a SHA-256 `planFingerprint` bound to the profile, complete plan values and filters, and effective write policy. Execute the unchanged plan with that fingerprint. The profile must set `allowWrites: true`; every execution requires both an approval token and the matching fingerprint. Update and delete require non-empty filters, are limited by `maxAffectedRows`, and roll back if the actual affected row count exceeds that limit. Delete additionally requires `allowDelete: true`. Existing table, column, and required-filter policies apply to mutations. The fingerprint prevents plan drift; it does not authenticate the approval token.
 
 ## Example Agent Workflow
 
@@ -199,6 +201,8 @@ npm run db-agent -- health --profile production --approve change-ticket-123
 
 Audit events are written as JSON Lines with duration, affected or returned row count, and a one-way statement fingerprint, without parameter values. Production profiles require `--approve` by default. Reads use database-side read-only sessions. Approved mutations run in a transaction and roll back on failure or limit violations.
 
+CLI failures and MCP tool failures share the same structured shape: `{"error":{"code":"...","message":"..."}}`. Stable codes cover profile, connection, write/delete permission, approval, fingerprint, filter, affected-row, schema, timeout, and rollback failures. Low-level database errors are sanitized before response or audit output.
+
 ## MCP Server
 
 The stdio MCP server exposes health, statistics, discovery, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, `EXPLAIN`, and cost assessment. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts InsertPlan, UpdatePlan, or DeletePlan. No tool accepts raw SQL.
@@ -207,7 +211,7 @@ The stdio MCP server exposes health, statistics, discovery, schema summaries, in
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
 ```
 
-Use the same profiles and policy controls as the CLI. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect the real schema and turn a natural-language request into a constrained Query Plan before calling the server. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
+Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; `database_mutation_plan` previews by default and requires `confirmFingerprint` when `execute` is true. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect the real schema and turn a natural-language request into a constrained Query Plan before calling the server. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
 
 ## Development
 

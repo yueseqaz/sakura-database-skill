@@ -49,7 +49,10 @@ test('previews and transactionally executes insert, update, and delete plans', {
   const runMutation = async (plan: unknown, execute = false) => {
     await writeFile(planPath, JSON.stringify(plan))
     const args = ['mutate', '--file', planPath, '--profile', 'writer', '--config', configPath]
-    if (execute) args.push('--execute', '--approve', 'test-ticket')
+    if (execute) {
+      const preview = JSON.parse((await cli(args, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as { planFingerprint: string }
+      args.push('--execute', '--approve', 'test-ticket', '--confirm', preview.planFingerprint)
+    }
     return JSON.parse((await cli(args, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as Record<string, unknown>
   }
   try {
@@ -102,6 +105,8 @@ test('reports local readiness through the doctor command', async () => {
 
 test('rejects the removed raw SQL command', async () => {
   await assert.rejects(() => cli(['query', '--sql', 'select 1'], {}), (error: unknown) => {
-    return error instanceof Error && /Unknown command: query/.test((error as Error & { stderr?: string }).stderr ?? error.message)
+    if (!(error instanceof Error)) return false
+    const payload = JSON.parse((error as Error & { stderr?: string }).stderr ?? '{}') as { error?: { code?: string; message?: string } }
+    return payload.error?.code === 'INVALID_REQUEST' && payload.error.message === 'Unknown command: query'
   })
 })

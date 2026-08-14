@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { DatabaseClient } from './database.js'
 import type { ObservedTable, Policy, QueryFilter, QueryPredicate, QueryOperator } from './core.js'
 
@@ -43,6 +44,31 @@ function mutationValue(value: unknown): unknown {
 
 function maximumAffectedRows(policy: MutationPolicy): number {
   return Math.max(1, Math.min(policy.maxAffectedRows ?? 100, 10_000))
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, item]) => item !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+export function mutationPlanFingerprint(profileName: string, plan: MutationPlan, policy: MutationPolicy): string {
+  const effectivePolicy = {
+    allowWrites: policy.allowWrites === true,
+    allowDelete: policy.allowDelete === true,
+    maxAffectedRows: maximumAffectedRows(policy),
+    allowedTables: policy.allowedTables ? [...policy.allowedTables].sort() : undefined,
+    deniedTables: policy.deniedTables ? [...policy.deniedTables].sort() : undefined,
+    allowedColumns: policy.allowedColumns,
+    deniedColumns: policy.deniedColumns,
+    requiredFilters: policy.requiredFilters,
+  }
+  return createHash('sha256').update(canonicalJson({ profileName, plan, policy: effectivePolicy })).digest('hex')
 }
 
 function assertTable(table: string, policy: MutationPolicy): void {
@@ -119,9 +145,10 @@ function assertRequiredFilters(plan: MutationPlan, policy: MutationPolicy): void
   for (const column of required) if (!filtered.has(column)) throw new Error(`Missing required filter: ${plan.table}.${column}`)
 }
 
-export function validateMutationExecution(policy: MutationPolicy, execute: boolean, approvalToken: string | undefined): void {
+export function validateMutationExecution(policy: MutationPolicy, execute: boolean, approvalToken: string | undefined, confirmFingerprint?: string, expectedFingerprint?: string): void {
   if (policy.allowWrites !== true) throw new Error('Mutation plans require allowWrites: true in the selected profile.')
   if (execute && !approvalToken) throw new Error('An approval token is required to execute a mutation.')
+  if (execute && (!confirmFingerprint || confirmFingerprint !== expectedFingerprint)) throw new Error('Mutation execution requires the matching preview fingerprint.')
 }
 
 export function compileMutationPlan(plan: MutationPlan, policy: MutationPolicy): CompiledMutation {
@@ -179,17 +206,18 @@ export function validateMutationSchema(plan: MutationPlan, tables: ObservedTable
   }
 }
 
-export async function previewMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy) {
+export async function previewMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy, profileName = 'default') {
   const compiled = compileMutationPlan(plan, policy)
-  if (plan.operation === 'insert') return { operation: plan.operation, table: plan.table, estimatedRows: plan.rows.length, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: false }
+  const planFingerprint = mutationPlanFingerprint(profileName, plan, policy)
+  if (plan.operation === 'insert') return { operation: plan.operation, table: plan.table, estimatedRows: plan.rows.length, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: false, planFingerprint }
   const where = compileWhere(plan.where, plan.table, policy)
   const result = await db.execute(`select count(*) as affected_rows from ${identifier(plan.table)} where ${where.sql}`, where.parameters)
   const estimatedRows = Number(result.rows[0]?.affected_rows ?? 0)
-  return { operation: plan.operation, table: plan.table, estimatedRows, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: estimatedRows > compiled.maximumAffectedRows }
+  return { operation: plan.operation, table: plan.table, estimatedRows, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: estimatedRows > compiled.maximumAffectedRows, planFingerprint }
 }
 
-export async function executeMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy, approvalToken?: string) {
-  validateMutationExecution(policy, true, approvalToken)
+export async function executeMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy, approvalToken?: string, confirmFingerprint?: string, profileName = 'default') {
+  validateMutationExecution(policy, true, approvalToken, confirmFingerprint, mutationPlanFingerprint(profileName, plan, policy))
   const compiled = compileMutationPlan(plan, policy)
   return db.transaction(async (transaction) => {
     const result = await transaction.execute(compiled.sql, compiled.parameters)

@@ -3,11 +3,12 @@ import { readFile } from 'node:fs/promises'
 import { compileSelectPlan, maskRows, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { defaultAuditPath, fingerprintStatement, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
-import { connect, discover, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
+import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 import { doctor } from './doctor.js'
-import { compileMutationPlan, executeMutation, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
+import { compileMutationPlan, executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
+import { errorPayload } from './errors.js'
 
 type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
 type OutputFormat = 'json' | 'table' | 'csv'
@@ -51,7 +52,7 @@ function usage(): void {
 Database commands:
   health                         Check connectivity.
   stats                          Summarize tables and estimated storage.
-  discover [--table name]        Discover tables and columns.
+  discover [--table name]        Discover paginated tables and columns (--limit/--cursor).
   summary [--table name]         Summarize table and sensitive-column counts.
   plan --file <plan.json>        Run a parameterized SelectPlan.
   explain --file <plan.json>     Inspect a SelectPlan execution plan.
@@ -65,7 +66,7 @@ Configuration:
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
 
-Mutation execution: mutate --file <plan.json> --profile name --execute --approve token
+Mutation execution: mutate --file <plan.json> --profile name --execute --approve token --confirm fingerprint
 Common options: --profile name --config path --approve token --format json|table|csv
 Environment: DATABASE_URL=mysql://user:password@host:3306/database`)
 }
@@ -94,7 +95,7 @@ function output(value: unknown, format: OutputFormat = 'json'): void {
   console.log(JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item, 2))
 }
 
-function schemaTables(entries: Awaited<ReturnType<typeof discover>>): SchemaTable[] {
+function schemaTables(entries: Awaited<ReturnType<typeof discoverTables>>): SchemaTable[] {
   return entries.map((table) => ({ name: table.name, columns: table.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) }))
 }
 
@@ -143,9 +144,13 @@ async function run(): Promise<void> {
     let result: unknown
     if (args.command === 'health') result = { ...(await executeWithTimeout(health(db), profile.timeoutMs)), dialect }
     else if (args.command === 'stats') result = await executeWithTimeout(statistics(db, dialect), profile.timeoutMs)
-    else if (args.command === 'discover') result = await executeWithTimeout(discover(db, stringValue(args.values, 'table')), profile.timeoutMs)
+    else if (args.command === 'discover') result = await executeWithTimeout(discoverPage(db, {
+      search: stringValue(args.values, 'table'), cursor: stringValue(args.values, 'cursor'),
+      limit: Number(stringValue(args.values, 'limit') ?? 50),
+    }), profile.timeoutMs)
     else if (args.command === 'summary') {
-      const tables = schemaTables(await executeWithTimeout(discover(db, stringValue(args.values, 'table')), profile.timeoutMs))
+      const page = await executeWithTimeout(discoverPage(db, { search: stringValue(args.values, 'table'), limit: Number(stringValue(args.values, 'limit') ?? 50) }), profile.timeoutMs)
+      const tables = schemaTables(page.tables)
       result = summarizeSchema(tables)
     } else if (args.command === 'indexes') {
       const table = stringValue(args.values, 'table')
@@ -158,17 +163,19 @@ async function run(): Promise<void> {
       const plan = JSON.parse(await readFile(file, 'utf8')) as MutationPlan
       const execute = args.values.execute === true
       const approvalToken = stringValue(args.values, 'approve')
-      validateMutationExecution(profile, execute, approvalToken)
-      validateMutationSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
+      const profileName = resolvedProfile?.name ?? 'environment'
+      const confirmFingerprint = stringValue(args.values, 'confirm')
+      validateMutationExecution(profile, execute, approvalToken, confirmFingerprint, mutationPlanFingerprint(profileName, plan, profile))
+      validateMutationSchema(plan, await executeWithTimeout(discoverTables(db, [plan.table]), profile.timeoutMs))
       const compiled = compileMutationPlan(plan, profile)
       fingerprint = fingerprintStatement(compiled.sql)
       action = `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`
       if (execute) {
-        const mutation = await executeWithTimeout(executeMutation(db, plan, profile, approvalToken), profile.timeoutMs)
+        const mutation = await executeWithTimeout(executeMutation(db, plan, profile, approvalToken, confirmFingerprint, profileName), profile.timeoutMs)
         rowCount = mutation.affectedRows
         result = { mode: 'executed', ...mutation }
       } else {
-        const preview = await executeWithTimeout(previewMutation(db, plan, profile), profile.timeoutMs)
+        const preview = await executeWithTimeout(previewMutation(db, plan, profile, profileName), profile.timeoutMs)
         rowCount = preview.estimatedRows
         result = { mode: 'preview', ...preview }
       }
@@ -178,7 +185,7 @@ async function run(): Promise<void> {
       if (!file) throw new Error(`${args.command} requires --file <plan.json>.`)
       const plan = JSON.parse(await readFile(file, 'utf8')) as SelectPlan
       const compiledPlan = compileSelectPlan(plan, profile, dialect)
-      validatePlanSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
+      validatePlanSchema(plan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), profile.timeoutMs))
       validatePlanPolicy(plan, profile)
       fingerprint = fingerprintStatement(compiledPlan.sql)
       action = `${args.command}:${plan.table}`
@@ -202,7 +209,7 @@ async function run(): Promise<void> {
     await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
     output(result, format)
   } catch (error) {
-    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, error: error instanceof Error ? error.message : String(error), fingerprint, durationMs: Date.now() - startedAt }, auditPath)
+    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, error: JSON.stringify(errorPayload(error).error), fingerprint, durationMs: Date.now() - startedAt }, auditPath)
     throw error
   } finally {
     await db.destroy()
@@ -212,7 +219,7 @@ async function run(): Promise<void> {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   run().catch((error: unknown) => {
-    console.error(error instanceof Error ? error.message : String(error))
+    console.error(JSON.stringify(errorPayload(error)))
     process.exitCode = 1
   })
 }
