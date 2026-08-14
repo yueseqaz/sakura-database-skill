@@ -105,7 +105,7 @@ export async function executeWithTimeout<T>(operation: Promise<T>, timeoutMs = 1
 }
 
 export async function discover(db: DatabaseClient, tableName?: string) {
-  const pattern = tableName ? `%${tableName}%` : '%'
+  const pattern = tableName ? `%${tableName.toLowerCase()}%` : '%'
   const { rows } = await db.execute(`
     select t.table_schema as table_schema, t.table_name as table_name, t.table_type as table_type,
       c.column_name as column_name, c.data_type as data_type, c.is_nullable as is_nullable,
@@ -113,7 +113,7 @@ export async function discover(db: DatabaseClient, tableName?: string) {
     from information_schema.tables t
     join information_schema.columns c
       on c.table_schema = t.table_schema and c.table_name = t.table_name
-    where t.table_schema = database() and lower(t.table_name) like lower(?)
+    where t.table_schema = database() and lower(t.table_name) like ?
     order by t.table_name, c.ordinal_position
   `, [pattern])
   const tables = new Map<string, {
