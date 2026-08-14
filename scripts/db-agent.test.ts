@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ensureReadOnlyStatement, makeExplainStatement } from './db-agent.js'
+import { makeExplainStatement, safeStatement as ensureReadOnlyStatement } from './core.js'
 
 test('permits a single SELECT statement', () => {
   assert.equal(ensureReadOnlyStatement('select id from users;'), 'select id from users')

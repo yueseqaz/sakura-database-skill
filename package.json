@@ -4,14 +4,18 @@
   "type": "module",
   "scripts": {
     "db-agent": "tsx scripts/db-agent.ts",
-    "test": "tsx scripts/db-agent.test.ts",
+    "mcp": "tsx scripts/mcp-server.ts",
+    "test": "tsx --test scripts/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^12.4.1",
     "kysely": "^0.28.8",
     "mysql2": "^3.15.1",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

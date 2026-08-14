@@ -1,4 +1,4 @@
 interface:
   display_name: "Database Agent"
-  short_description: "Safely discover and query SQL databases"
-  default_prompt: "Use $database-agent to inspect this database schema and run a safe read-only query."
+  short_description: "Safe database access for AI agents"
+  default_prompt: "Use $database-agent to discover a database schema and run a safe parameterized query plan."

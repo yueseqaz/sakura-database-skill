@@ -2,29 +2,114 @@
 
 A universal database skill and TypeScript CLI for AI agents.
 
-Connect to MySQL, PostgreSQL, and SQLite databases to discover schemas, run safe read-only queries, inspect `EXPLAIN` plans, and check database health through a unified interface.
+Connect to local and remote MySQL, PostgreSQL, and SQLite databases. Discover schemas, execute bounded parameterized query plans, inspect `EXPLAIN` plans, analyze indexes and foreign keys, and check health through one policy-governed interface.
 
-## Quick start
+## Install
 
 ```bash
 npm install
+npm run db-agent -- --help
+```
 
+## Quick start
+
+Use a least-privilege database account. Credentials belong in an environment variable or secret manager, never in source control.
+
+```bash
 export DB_DIALECT=mysql
 export DATABASE_URL='mysql://readonly:password@localhost:3306/app'
 
 npm run db-agent -- health
-npm run db-agent -- discover
-npm run db-agent -- query --sql 'select id, status from orders limit 20'
-npm run db-agent -- explain --sql 'select id from orders where customer_id = 42'
+npm run db-agent -- stats
+npm run db-agent -- discover --table orders
+npm run db-agent -- indexes --table orders
+npm run db-agent -- relations --table orders
+npm run db-agent -- explain --sql 'select id from orders where customer_id = 42 limit 100'
 ```
 
-`DATABASE_URL` accepts normal PostgreSQL, MySQL, or SQLite URLs. MySQL JDBC-style options can be included in the query string; the CLI keeps only options supported by the Node.js driver.
+Raw SQL is read-only and must include a `LIMIT` unless it is an aggregate. Prefer a Query Plan for dynamic values.
 
-## Safety
+## Query Plans
 
-The CLI accepts exactly one `SELECT`, `WITH ... SELECT`, or `EXPLAIN` statement. It rejects writes, DDL, permission changes, administrative commands, and multiple statements. Use a least-privilege read-only database account and keep credentials in environment variables or a secret manager.
+Create `plan.json`:
 
-This project does not yet execute migrations, backups, restores, or writes. Those operations should be added as separate approval-gated capabilities.
+```json
+{
+  "table": "orders",
+  "columns": ["id", "status", "created_at"],
+  "where": [{ "column": "customer_id", "op": "=", "value": 42 }],
+  "orderBy": [{ "column": "created_at", "direction": "desc" }],
+  "limit": 50
+}
+```
+
+Then execute it:
+
+```bash
+npm run db-agent -- plan --file plan.json
+```
+
+The CLI validates identifiers and operators, binds values through Kysely, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. Use `--include-sensitive` only with explicit authorization.
+
+## Profiles, Auditing, And SSH
+
+Create a profile file:
+
+```bash
+npm run db-agent -- config init
+```
+
+It creates `~/.config/sakura-database-skill/profiles.json`. A profile can reference a credential environment variable, set result/time limits, configure a JSONL audit log, require approval for production, and define an SSH tunnel.
+
+```json
+{
+  "profiles": {
+    "production": {
+      "dialect": "mysql",
+      "urlEnv": "PRODUCTION_DATABASE_URL",
+      "environment": "production",
+      "maxRows": 50,
+      "timeoutMs": 5000,
+      "requireApproval": true,
+      "sshTunnel": {
+        "host": "bastion.example.com",
+        "user": "readonly",
+        "remoteHost": "database.internal",
+        "remotePort": 3306,
+        "localPort": 13306
+      }
+    }
+  }
+}
+```
+
+```bash
+npm run db-agent -- profile list
+npm run db-agent -- health --profile production --approve change-ticket-123
+```
+
+Audit events are written as JSON Lines, without query parameter values. Production profiles require `--approve` by default.
+
+## Guarded Operations
+
+Migrations, backup, and restore are intentionally preview-only. They never write to a database:
+
+```bash
+npm run db-agent -- migrate --file migrations/2026-01-add-index.sql --profile production --approve change-ticket-123
+npm run db-agent -- backup --destination backups/app.sql --profile production --approve change-ticket-123
+```
+
+Route an approved preview to a separate executor with organization-specific controls. Do not convert these commands into direct production writes without approval, recovery, and audit requirements.
+
+## MCP Server
+
+The stdio MCP server exposes read-only tools: `database_health`, `database_discover`, `database_query_plan`, and `database_explain`.
+
+```bash
+DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
+```
+
+Use the same profiles and policy controls as the CLI. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to turn natural-language requests into a constrained Query Plan before calling the server.
 
 ## Development
 
@@ -32,5 +117,3 @@ This project does not yet execute migrations, backups, restores, or writes. Thos
 npm test
 npm run typecheck
 ```
-
-The project is also packaged as a Codex Skill in [`SKILL.md`](SKILL.md).
