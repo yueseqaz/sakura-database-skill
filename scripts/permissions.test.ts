@@ -38,7 +38,24 @@ test('caches permission metadata for the life of a database connection', async (
   }
   await permissions(db)
   await permissions(db)
-  assert.equal(calls, 2)
+  assert.equal(calls, 3)
   await permissions(db, true)
-  assert.equal(calls, 4)
+  assert.equal(calls, 6)
+})
+
+test('falls back to SHOW GRANTS when privilege metadata is unavailable', async () => {
+  const db: DatabaseClient = {
+    async execute(statement) {
+      if (statement.includes('current_user() as account')) return { rows: [{ account: 'agent@%', database_name: 'app' }] }
+      if (statement.includes('information_schema.user_privileges')) return { rows: [] }
+      return { rows: [{ grants: 'GRANT ALL PRIVILEGES ON `app`.* TO `agent`@`%`' }] }
+    },
+    async transaction(run) { return run({ execute: db.execute }) },
+    async destroy() {},
+  }
+  const report = await permissions(db)
+  assert.equal(report.capabilities.query, true)
+  assert.equal(report.capabilities.createTable, true)
+  assert.equal(report.capabilities.createDatabase, false)
+  assert.equal(hasPrivilege(report, 'ALTER', 'users'), true)
 })

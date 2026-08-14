@@ -21,6 +21,7 @@ export interface PermissionReport {
 }
 
 const permissionCache = new WeakMap<DatabaseClient, Promise<PermissionReport>>()
+const relevantPrivileges: MySqlPrivilege[] = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'INDEX', 'REFERENCES']
 
 function grantee(account: string): string {
   const separator = account.lastIndexOf('@')
@@ -34,6 +35,39 @@ export function hasPrivilege(report: PermissionReport, privilege: MySqlPrivilege
   return report.privileges.some((entry) => entry.privilege === privilege && (
     entry.scope === 'global' || entry.scope === 'database' || (table !== undefined && entry.table === table)
   ))
+}
+
+function unquoteIdentifier(value: string): string {
+  const trimmed = value.trim()
+  return trimmed.startsWith('`') && trimmed.endsWith('`') ? trimmed.slice(1, -1).replaceAll('``', '`') : trimmed
+}
+
+function privilegesFromGrants(rows: Array<Record<string, unknown>>, database: string | null): PermissionReport['privileges'] {
+  const privileges: PermissionReport['privileges'] = []
+  for (const row of rows) {
+    const grant = String(Object.values(row)[0] ?? '')
+    const match = /^GRANT\s+(.+?)\s+ON\s+(.+?)\s+TO\s+/i.exec(grant)
+    if (!match) continue
+    const granted = match[1].toUpperCase() === 'ALL PRIVILEGES'
+      ? relevantPrivileges
+      : match[1].split(',').map((entry) => entry.trim().toUpperCase()).filter((entry): entry is MySqlPrivilege => relevantPrivileges.includes(entry as MySqlPrivilege))
+    const grantTarget = match[2]
+    let scope: 'global' | 'database' | 'table'
+    let table: string | undefined
+    if (grantTarget === '*.*') {
+      scope = 'global'
+    } else {
+      const separator = grantTarget.indexOf('.')
+      if (separator < 0) continue
+      const schema = unquoteIdentifier(grantTarget.slice(0, separator))
+      if (database !== schema) continue
+      const object = unquoteIdentifier(grantTarget.slice(separator + 1))
+      scope = object === '*' ? 'database' : 'table'
+      if (scope === 'table') table = object
+    }
+    for (const privilege of granted) privileges.push({ privilege, scope, ...(table ? { table } : {}) })
+  }
+  return privileges
 }
 
 function hasAnyPrivilege(report: PermissionReport, privilege: MySqlPrivilege): boolean {
@@ -55,11 +89,14 @@ async function loadPermissions(db: DatabaseClient): Promise<PermissionReport> {
     select privilege_type as privilege, 'table' as scope_name, table_name as table_name
     from information_schema.table_privileges where grantee = ? and table_schema = database()
   `, [owner, owner, owner])
-  const privileges = rows.map((row) => ({
+  let privileges = rows.map((row) => ({
     privilege: String(row.privilege).toUpperCase(),
     scope: String(row.scope_name) as 'global' | 'database' | 'table',
     ...(row.table_name == null ? {} : { table: String(row.table_name) }),
   }))
+  if (!privileges.some((entry) => relevantPrivileges.includes(entry.privilege as MySqlPrivilege))) {
+    privileges = privilegesFromGrants((await db.execute('show grants for current_user()')).rows, database)
+  }
   const report: PermissionReport = { account, database, privileges, capabilities: {} as PermissionReport['capabilities'] }
   report.capabilities = {
     query: hasAnyPrivilege(report, 'SELECT'),
