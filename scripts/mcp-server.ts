@@ -57,7 +57,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.7.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.7.1' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
