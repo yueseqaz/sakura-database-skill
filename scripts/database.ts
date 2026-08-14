@@ -1,6 +1,6 @@
 import { createPool, type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import type { DialectName } from './core.js'
-import { compileSelectPlan, type Policy, type SelectPlan } from './core.js'
+import { assertUserTable, compileSelectPlan, INTERNAL_IDEMPOTENCY_TABLE, type Policy, type SelectPlan } from './core.js'
 
 export interface DatabaseResult {
   rows: Array<Record<string, unknown>>
@@ -14,6 +14,7 @@ export interface TransactionClient {
 
 export interface DatabaseClient extends TransactionClient {
   transaction<T>(run: (transaction: TransactionClient) => Promise<T>): Promise<T>
+  ensureIdempotencyStore?(): Promise<void>
   destroy(): Promise<void>
 }
 
@@ -90,6 +91,25 @@ export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): 
         connection.release()
       }
     },
+    async ensureIdempotencyStore() {
+      const connection = await pool.getConnection()
+      try {
+        await connection.query('SET SESSION transaction_read_only = OFF')
+        await connection.query(`
+          create table if not exists \`__sakura_database_idempotency\` (
+            profile_name varchar(255) not null,
+            idempotency_key varchar(255) not null,
+            plan_fingerprint char(64) not null,
+            owner_token char(36) not null,
+            result_json json null,
+            created_at timestamp not null default current_timestamp,
+            primary key (profile_name, idempotency_key)
+          ) engine=InnoDB
+        `)
+      } finally {
+        connection.release()
+      }
+    },
     async destroy() { await pool.end() },
   }
 }
@@ -135,6 +155,7 @@ function mapDiscoveredTables(rows: Array<Record<string, unknown>>): DiscoveredTa
 export async function discoverTables(db: DatabaseClient, tableNames: string[]): Promise<DiscoveredTable[]> {
   const names = [...new Set(tableNames)]
   if (names.length === 0) return []
+  for (const name of names) assertUserTable(name)
   if (names.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error('Schema discovery requires safe table names.')
   const { rows } = await db.execute(`
     select t.table_schema as table_schema, t.table_name as table_name, t.table_type as table_type,
@@ -168,7 +189,7 @@ export async function discoverPage(db: DatabaseClient, options: DiscoveryOptions
   const { rows } = await db.execute(`
     select table_name as table_name
     from information_schema.tables
-    where table_schema = database() and lower(table_name) like ? and table_name > ?
+    where table_schema = database() and table_name <> '${INTERNAL_IDEMPOTENCY_TABLE}' and lower(table_name) like ? and table_name > ?
     order by table_name
     limit ${limit + 1}
   `, [pattern, cursor])
@@ -192,7 +213,7 @@ export async function statistics(db: DatabaseClient, _dialect: DialectName) {
     select table_schema as schema_name, count(*) as table_count,
       coalesce(sum(table_rows), 0) as estimated_rows,
       coalesce(sum(data_length + index_length), 0) as bytes
-    from information_schema.tables where table_schema = database() group by table_schema
+    from information_schema.tables where table_schema = database() and table_name <> '${INTERNAL_IDEMPOTENCY_TABLE}' group by table_schema
   `)).rows
 }
 
@@ -210,16 +231,19 @@ export async function explainPlan(db: DatabaseClient, plan: SelectPlan, policy: 
 }
 
 export async function indexes(db: DatabaseClient, _dialect: DialectName, table: string) {
+  assertUserTable(table)
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) throw new Error(`Unsafe identifier: ${table}`)
   return (await db.execute(`show index from \`${table}\``)).rows
 }
 
 export async function relationships(db: DatabaseClient, _dialect: DialectName, table?: string) {
+  if (table) assertUserTable(table)
   const { rows } = await db.execute(`
     select table_name as table_name, column_name as column_name,
       referenced_table_name as referenced_table_name, referenced_column_name as referenced_column_name
     from information_schema.key_column_usage
     where table_schema = database() and referenced_table_name is not null
+      and table_name <> '${INTERNAL_IDEMPOTENCY_TABLE}' and referenced_table_name <> '${INTERNAL_IDEMPOTENCY_TABLE}'
       and (? is null or table_name = ?)
     order by table_name, column_name
   `, [table ?? null, table ?? null])

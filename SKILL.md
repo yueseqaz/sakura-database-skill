@@ -17,6 +17,8 @@ Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language re
 
 For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Preserve its `planFingerprint`. Execute only after the user approves that exact preview, using `execute: true`, the supplied approval token, and `confirmFingerprint`. If the plan or policy changes, preview again. Never invent an approval token or fingerprint.
 
+For insert execution, supply a stable `idempotencyKey` derived from the user task and reuse it for every retry. Never change the key merely because a call timed out. For an update or delete that may race with another writer, include `optimisticLock` with an observed version or `updated_at` value and update the version in `set`. On `CONCURRENT_MODIFICATION`, read and preview again; never remove the lock to force the write.
+
 ```json
 {
   "table": "orders",
@@ -33,13 +35,15 @@ npm run db-agent -- plan --file plan.json --profile development
 npm run db-agent -- assess --file plan.json
 npm run db-agent -- explain --file plan.json
 npm run db-agent -- mutate --file mutation.json --profile writer
-npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint>
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key <task-key>
 ```
 
 ## Profiles And Security
 
 - Use profiles for remote or production databases. Credentials must be supplied by `urlEnv`, not committed to a profile.
 - Every mutation execution requires `--approve <ticket-or-token>` and the exact preview fingerprint through `--confirm`. Never reuse or invent approval.
+- Reuse one idempotency key for all retries of an insert. Use optional idempotency for retry-sensitive updates or deletes.
+- Preserve `optimisticLock` after a concurrent-modification failure; refresh the row and preview again.
 - Treat `allowedTables`, `allowedColumns`, `deniedColumns`, and `requiredFilters` as hard boundaries.
 - Use `--include-sensitive` only when the profile sets `allowSensitive: true` and the user explicitly authorizes disclosure.
 - Prefer separate least-privilege read-only and writer profiles. Keep `allowWrites` false unless writes are required; enable `allowDelete` separately and set a small `maxAffectedRows`.
@@ -49,4 +53,4 @@ npm run db-agent -- mutate --file mutation.json --profile writer --execute --app
 
 ## MCP
 
-Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. Pass the returned `planFingerprint` as `confirmFingerprint` only after approval. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same paginated/on-demand schema validation, profile policy, limits, structured error codes, approval, transactions, rollback, masking, and audit controls.
+Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. Pass the returned `planFingerprint` as `confirmFingerprint` only after approval, plus `idempotencyKey` for inserts. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same paginated/on-demand schema validation, optimistic locking, idempotency, profile policy, limits, structured error codes, approval, transactions, rollback, masking, and audit controls.

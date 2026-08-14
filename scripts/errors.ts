@@ -12,6 +12,9 @@ export type DatabaseAgentErrorCode =
   | 'COLUMN_DENIED'
   | 'QUERY_TIMEOUT'
   | 'TRANSACTION_ROLLED_BACK'
+  | 'CONCURRENT_MODIFICATION'
+  | 'IDEMPOTENCY_REQUIRED'
+  | 'IDEMPOTENCY_CONFLICT'
   | 'INVALID_REQUEST'
   | 'DATABASE_ERROR'
 
@@ -28,6 +31,9 @@ const messageMappings: Array<[RegExp, DatabaseAgentErrorCode]> = [
   [/allowDelete/i, 'DELETE_NOT_ALLOWED'],
   [/approval token/i, 'APPROVAL_REQUIRED'],
   [/preview fingerprint/i, 'PLAN_FINGERPRINT_MISMATCH'],
+  [/requires an idempotency key/i, 'IDEMPOTENCY_REQUIRED'],
+  [/Idempotency key was already used|previous idempotent mutation/i, 'IDEMPOTENCY_CONFLICT'],
+  [/changed since preview/i, 'CONCURRENT_MODIFICATION'],
   [/non-empty filter|plans require .*filter/i, 'FILTER_REQUIRED'],
   [/affected-row limit|exceeds the affected-row/i, 'AFFECTED_ROWS_EXCEEDED'],
   [/Unknown table/i, 'TABLE_NOT_FOUND'],

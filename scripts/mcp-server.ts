@@ -57,7 +57,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.6.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.7.0' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
@@ -173,10 +173,11 @@ const mutationFilterSchema: z.ZodType<unknown> = z.lazy(() => z.union([
   z.object({ or: z.array(mutationFilterSchema).min(1) }),
 ]))
 const mutationWhereSchema = z.union([z.array(mutationPredicateSchema).min(1), mutationFilterSchema])
+const optimisticLockSchema = z.object({ column: z.string(), value: mutationValueSchema })
 const mutationPlanSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('insert'), table: z.string(), rows: z.array(mutationRowSchema).min(1) }),
-  z.object({ operation: z.literal('update'), table: z.string(), set: mutationRowSchema, where: mutationWhereSchema }),
-  z.object({ operation: z.literal('delete'), table: z.string(), where: mutationWhereSchema }),
+  z.object({ operation: z.literal('update'), table: z.string(), set: mutationRowSchema, where: mutationWhereSchema, optimisticLock: optimisticLockSchema.optional() }),
+  z.object({ operation: z.literal('delete'), table: z.string(), where: mutationWhereSchema, optimisticLock: optimisticLockSchema.optional() }),
 ])
 
 server.registerTool('database_query_plan', {
@@ -202,15 +203,17 @@ server.registerTool('database_query_plan', {
 server.registerTool('database_mutation_plan', {
   title: 'Preview or execute a safe mutation plan',
   description: 'Preview a structured InsertPlan, UpdatePlan, or DeletePlan by default. Execution requires profile write permission and an approval token.',
-  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(), confirmFingerprint: z.string().optional() },
+  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(), confirmFingerprint: z.string().optional(), idempotencyKey: z.string().optional() },
   annotations: { readOnlyHint: false, destructiveHint: true },
-}, async ({ profile, plan, execute, approvalToken, confirmFingerprint }) => {
+}, async ({ profile, plan, execute, approvalToken, confirmFingerprint, idempotencyKey }) => {
   try {
     return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`, approvalToken, async ({ db, timeoutMs, policy }) => {
       validateMutationExecution(policy, execute === true, approvalToken, confirmFingerprint, mutationPlanFingerprint(profile, plan as MutationPlan, policy))
       validateMutationSchema(plan as MutationPlan, await executeWithTimeout(discoverTables(db, [plan.table]), timeoutMs))
       if (execute === true) {
-        const mutation = await executeWithTimeout(executeMutation(db, plan as MutationPlan, policy, approvalToken, confirmFingerprint, profile), timeoutMs)
+        const mutation = await executeWithTimeout(executeMutation(db, plan as MutationPlan, policy, {
+          approvalToken, confirmFingerprint, profileName: profile, idempotencyKey,
+        }), timeoutMs)
         return { mode: 'executed', ...mutation }
       }
       return { mode: 'preview', ...(await executeWithTimeout(previewMutation(db, plan as MutationPlan, policy, profile), timeoutMs)) }

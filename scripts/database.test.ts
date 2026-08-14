@@ -70,6 +70,7 @@ test('discovers exact plan tables without scanning the full schema', async () =>
   assert.deepEqual(tables.map((table) => table.name), ['users', 'orders'])
   assert.match(calls[0].statement, /table_name in \(\?, \?\)/i)
   assert.deepEqual(calls[0].parameters, ['users', 'orders'])
+  await assert.rejects(() => discoverTables(db, ['__sakura_database_idempotency']), /reserved internal table/i)
 })
 
 test('paginates schema discovery with an opaque cursor', async () => {

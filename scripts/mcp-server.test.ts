@@ -25,6 +25,7 @@ test('MCP explain and assess accept plans instead of raw SQL', async () => {
     assert.ok(mutationSchema.properties?.plan)
     assert.ok(mutationSchema.properties?.execute)
     assert.ok(mutationSchema.properties?.confirmFingerprint)
+    assert.ok(mutationSchema.properties?.idempotencyKey)
     assert.equal(mutation?.annotations?.destructiveHint, true)
   } finally {
     await client.close()

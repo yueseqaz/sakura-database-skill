@@ -8,6 +8,8 @@ test('maps safety failures to stable structured error codes', () => {
   })
   assert.equal(errorPayload(new Error('Mutation execution requires the matching preview fingerprint.')).error.code, 'PLAN_FINGERPRINT_MISMATCH')
   assert.equal(errorPayload(new Error('Unknown table in observed schema: users')).error.code, 'TABLE_NOT_FOUND')
+  assert.equal(errorPayload(new Error('The row changed since preview.')).error.code, 'CONCURRENT_MODIFICATION')
+  assert.equal(errorPayload(new Error('Idempotency key was already used for a different mutation plan.')).error.code, 'IDEMPOTENCY_CONFLICT')
 })
 
 test('redacts low-level connection errors and credentials', () => {

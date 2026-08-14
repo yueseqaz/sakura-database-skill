@@ -99,17 +99,24 @@ Use one structured Mutation Plan for insert, update, or delete. Preview is the d
 {
   "operation": "update",
   "table": "orders",
-  "set": { "status": "closed" },
-  "where": { "column": "tenant_id", "op": "=", "value": 42 }
+  "set": { "status": "closed", "version": 8 },
+  "where": { "column": "tenant_id", "op": "=", "value": 42 },
+  "optimisticLock": { "column": "version", "value": 7 }
 }
 ```
 
 ```bash
 npm run db-agent -- mutate --file mutation.json --profile writer
-npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint>
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key task-9321
 ```
 
 The preview returns a SHA-256 `planFingerprint` bound to the profile, complete plan values and filters, and effective write policy. Execute the unchanged plan with that fingerprint. The profile must set `allowWrites: true`; every execution requires both an approval token and the matching fingerprint. Update and delete require non-empty filters, are limited by `maxAffectedRows`, and roll back if the actual affected row count exceeds that limit. Delete additionally requires `allowDelete: true`. Existing table, column, and required-filter policies apply to mutations. The fingerprint prevents plan drift; it does not authenticate the approval token.
+
+Insert execution also requires `--idempotency-key`. Retrying the same profile, key, and plan returns the first result with `idempotentReplay: true` without inserting again. Reusing a key for a different plan is rejected. Updates and deletes may also supply a key when the caller needs retry deduplication. Keys are execution identifiers, not secrets, and retries must reuse the original key.
+
+The idempotency record and business mutation commit in one transaction. On first use, the tool lazily creates the reserved `__sakura_database_idempotency` table; the writer needs `CREATE` permission for that one-time setup, or an administrator can provision the table first. The table is excluded from discovery, statistics, queries, indexes, relations, and mutation plans.
+
+`optimisticLock` is optional for update and delete. It adds an equality condition for a version or `updated_at` column. When the value changed after preview, execution rolls back with `CONCURRENT_MODIFICATION`. Read the current row and preview again instead of removing the lock. This adds no extra query; the guard is part of the mutation's existing `WHERE` clause.
 
 ## Example Agent Workflow
 
@@ -201,7 +208,7 @@ npm run db-agent -- health --profile production --approve change-ticket-123
 
 Audit events are written as JSON Lines with duration, affected or returned row count, and a one-way statement fingerprint, without parameter values. Production profiles require `--approve` by default. Reads use database-side read-only sessions. Approved mutations run in a transaction and roll back on failure or limit violations.
 
-CLI failures and MCP tool failures share the same structured shape: `{"error":{"code":"...","message":"..."}}`. Stable codes cover profile, connection, write/delete permission, approval, fingerprint, filter, affected-row, schema, timeout, and rollback failures. Low-level database errors are sanitized before response or audit output.
+CLI failures and MCP tool failures share the same structured shape: `{"error":{"code":"...","message":"..."}}`. Stable codes cover profile, connection, write/delete permission, approval, fingerprint, idempotency, concurrent modification, filter, affected-row, schema, timeout, and rollback failures. Low-level database errors are sanitized before response or audit output.
 
 ## MCP Server
 
@@ -211,7 +218,7 @@ The stdio MCP server exposes health, statistics, discovery, schema summaries, in
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
 ```
 
-Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; `database_mutation_plan` previews by default and requires `confirmFingerprint` when `execute` is true. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect the real schema and turn a natural-language request into a constrained Query Plan before calling the server. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
+Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; `database_mutation_plan` previews by default and requires `confirmFingerprint` when `execute` is true. Pass `idempotencyKey` for inserts and optional retry-safe updates/deletes. Mutation plans may include `optimisticLock`. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect the real schema and turn a natural-language request into a constrained Query Plan before calling the server. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
 
 ## Development
 

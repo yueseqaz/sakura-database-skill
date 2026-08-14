@@ -41,7 +41,7 @@ test('previews and transactionally executes insert, update, and delete plans', {
   const auditPath = join(directory, 'audit.jsonl')
   const table = `mutation_users_${process.pid}`
   const setup = createPool(process.env.TEST_MYSQL_URL as string)
-  await setup.query(`create table \`${table}\` (id integer primary key auto_increment, tenant_id integer not null, name varchar(255), status varchar(32))`)
+  await setup.query(`create table \`${table}\` (id integer primary key auto_increment, tenant_id integer not null, name varchar(255), status varchar(32), version integer not null default 1)`)
   await writeFile(configPath, JSON.stringify({ profiles: { writer: {
     dialect: 'mysql', urlEnv: 'TEST_MYSQL_URL', environment: 'development', allowWrites: true, allowDelete: true,
     maxAffectedRows: 2, allowedTables: [table], requiredFilters: { [table]: ['tenant_id'] }, auditLog: auditPath,
@@ -52,6 +52,7 @@ test('previews and transactionally executes insert, update, and delete plans', {
     if (execute) {
       const preview = JSON.parse((await cli(args, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as { planFingerprint: string }
       args.push('--execute', '--approve', 'test-ticket', '--confirm', preview.planFingerprint)
+      if ((plan as { operation?: string }).operation === 'insert') args.push('--idempotency-key', `${table}:insert`)
     }
     return JSON.parse((await cli(args, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as Record<string, unknown>
   }
@@ -59,12 +60,15 @@ test('previews and transactionally executes insert, update, and delete plans', {
     const insert = { operation: 'insert', table, rows: [{ tenant_id: 7, name: 'Ada', status: 'active' }] }
     assert.equal((await runMutation(insert)).mode, 'preview')
     assert.equal(((await setup.query(`select count(*) count from \`${table}\``))[0] as RowDataPacket[])[0].count, 0)
-    assert.equal((await runMutation(insert, true)).affectedRows, 1)
+    assert.deepEqual({ affectedRows: (await runMutation(insert, true)).affectedRows, replay: (await runMutation(insert, true)).idempotentReplay }, { affectedRows: 1, replay: true })
+    assert.equal(((await setup.query(`select count(*) count from \`${table}\``))[0] as RowDataPacket[])[0].count, 1)
 
-    assert.equal((await runMutation({ operation: 'update', table, set: { status: 'disabled' }, where: { column: 'tenant_id', op: '=', value: 7 } }, true)).affectedRows, 1)
+    const update = { operation: 'update', table, set: { status: 'disabled', version: 2 }, where: { column: 'tenant_id', op: '=', value: 7 }, optimisticLock: { column: 'version', value: 1 } }
+    assert.equal((await runMutation(update, true)).affectedRows, 1)
     assert.equal(((await setup.query(`select status from \`${table}\` where tenant_id = 7`))[0] as RowDataPacket[])[0].status, 'disabled')
+    await assert.rejects(() => runMutation(update, true), /CONCURRENT_MODIFICATION/)
 
-    assert.equal((await runMutation({ operation: 'delete', table, where: { column: 'tenant_id', op: '=', value: 7 } }, true)).affectedRows, 1)
+    assert.equal((await runMutation({ operation: 'delete', table, where: { column: 'tenant_id', op: '=', value: 7 }, optimisticLock: { column: 'version', value: 2 } }, true)).affectedRows, 1)
     assert.equal(((await setup.query(`select count(*) count from \`${table}\``))[0] as RowDataPacket[])[0].count, 0)
     assert.match(await readFile(auditPath, 'utf8'), new RegExp(`execute:delete:${table}`))
   } finally {

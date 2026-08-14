@@ -1,13 +1,14 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { DatabaseClient } from './database.js'
-import type { ObservedTable, Policy, QueryFilter, QueryPredicate, QueryOperator } from './core.js'
+import { assertUserTable, type ObservedTable, type Policy, type QueryFilter, type QueryPredicate, type QueryOperator } from './core.js'
 
 type MutationWhere = QueryPredicate[] | QueryFilter
 type MutationRow = Record<string, unknown>
 
 export interface InsertPlan { operation: 'insert'; table: string; rows: MutationRow[] }
-export interface UpdatePlan { operation: 'update'; table: string; set: MutationRow; where: MutationWhere }
-export interface DeletePlan { operation: 'delete'; table: string; where: MutationWhere }
+export interface OptimisticLock { column: string; value: unknown }
+export interface UpdatePlan { operation: 'update'; table: string; set: MutationRow; where: MutationWhere; optimisticLock?: OptimisticLock }
+export interface DeletePlan { operation: 'delete'; table: string; where: MutationWhere; optimisticLock?: OptimisticLock }
 export type MutationPlan = InsertPlan | UpdatePlan | DeletePlan
 
 export interface CompiledMutation {
@@ -21,6 +22,21 @@ export interface CompiledMutation {
 export interface MutationPolicy extends Pick<Policy,
   'allowWrites' | 'allowDelete' | 'maxAffectedRows' | 'allowedTables' | 'deniedTables' |
   'allowedColumns' | 'deniedColumns' | 'requiredFilters'> {}
+
+export interface MutationExecutionOptions {
+  approvalToken?: string
+  confirmFingerprint?: string
+  profileName?: string
+  idempotencyKey?: string
+}
+
+export interface MutationExecutionResult {
+  operation: MutationPlan['operation']
+  table: string
+  affectedRows: number
+  insertId?: number
+  idempotentReplay?: boolean
+}
 
 function identifier(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error(`Unsafe mutation identifier: ${value}`)
@@ -73,6 +89,7 @@ export function mutationPlanFingerprint(profileName: string, plan: MutationPlan,
 
 function assertTable(table: string, policy: MutationPolicy): void {
   identifier(table)
+  assertUserTable(table)
   if (policy.allowWrites !== true) throw new Error('Mutation plans require allowWrites: true in the selected profile.')
   if (policy.allowedTables && !policy.allowedTables.includes(table)) throw new Error(`Table is not allowed by policy: ${table}`)
   if (policy.deniedTables?.includes(table)) throw new Error(`Table is denied by policy: ${table}`)
@@ -145,6 +162,12 @@ function assertRequiredFilters(plan: MutationPlan, policy: MutationPolicy): void
   for (const column of required) if (!filtered.has(column)) throw new Error(`Missing required filter: ${plan.table}.${column}`)
 }
 
+function guardedWhere(plan: UpdatePlan | DeletePlan): MutationWhere {
+  if (!plan.optimisticLock) return plan.where
+  const base: QueryFilter = Array.isArray(plan.where) ? { and: plan.where } : plan.where
+  return { and: [base, { column: plan.optimisticLock.column, op: '=', value: plan.optimisticLock.value }] }
+}
+
 export function validateMutationExecution(policy: MutationPolicy, execute: boolean, approvalToken: string | undefined, confirmFingerprint?: string, expectedFingerprint?: string): void {
   if (policy.allowWrites !== true) throw new Error('Mutation plans require allowWrites: true in the selected profile.')
   if (execute && !approvalToken) throw new Error('An approval token is required to execute a mutation.')
@@ -174,7 +197,7 @@ export function compileMutationPlan(plan: MutationPlan, policy: MutationPolicy):
   }
   if (!plan.where) throw new Error(`${plan.operation} plans require a non-empty filter.`)
   assertRequiredFilters(plan, policy)
-  const where = compileWhere(plan.where, plan.table, policy)
+  const where = compileWhere(guardedWhere(plan), plan.table, policy)
   if (plan.operation === 'update') {
     const entries = Object.entries(mutationRecord(plan.set, 'Update set'))
     if (entries.length === 0) throw new Error('Update plans require at least one changed column.')
@@ -203,6 +226,7 @@ export function validateMutationSchema(plan: MutationPlan, tables: ObservedTable
   else {
     if (plan.operation === 'update') Object.keys(plan.set).forEach(assertKnown)
     visitWhere(plan.where)
+    if (plan.optimisticLock) assertKnown(plan.optimisticLock.column)
   }
 }
 
@@ -210,19 +234,75 @@ export async function previewMutation(db: DatabaseClient, plan: MutationPlan, po
   const compiled = compileMutationPlan(plan, policy)
   const planFingerprint = mutationPlanFingerprint(profileName, plan, policy)
   if (plan.operation === 'insert') return { operation: plan.operation, table: plan.table, estimatedRows: plan.rows.length, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: false, planFingerprint }
-  const where = compileWhere(plan.where, plan.table, policy)
+  const where = compileWhere(guardedWhere(plan), plan.table, policy)
   const result = await db.execute(`select count(*) as affected_rows from ${identifier(plan.table)} where ${where.sql}`, where.parameters)
   const estimatedRows = Number(result.rows[0]?.affected_rows ?? 0)
   return { operation: plan.operation, table: plan.table, estimatedRows, maximumAffectedRows: compiled.maximumAffectedRows, exceedsLimit: estimatedRows > compiled.maximumAffectedRows, planFingerprint }
 }
 
-export async function executeMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy, approvalToken?: string, confirmFingerprint?: string, profileName = 'default') {
-  validateMutationExecution(policy, true, approvalToken, confirmFingerprint, mutationPlanFingerprint(profileName, plan, policy))
+function isMissingIdempotencyStore(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && (error as { code?: unknown }).code === 'ER_NO_SUCH_TABLE')
+}
+
+function validateIdempotencyKey(plan: MutationPlan, key: string | undefined): void {
+  if (plan.operation === 'insert' && !key) throw new Error('Insert execution requires an idempotency key.')
+  if (key && (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(key) || key.length > 255)) {
+    throw new Error('Idempotency key must be 1-255 characters using letters, numbers, dot, underscore, colon, or hyphen.')
+  }
+}
+
+function parseStoredMutationResult(value: unknown): MutationExecutionResult {
+  if (!value || typeof value !== 'object') throw new Error('The previous idempotent mutation stored an invalid result.')
+  const result = value as Record<string, unknown>
+  if (!['insert', 'update', 'delete'].includes(String(result.operation)) || typeof result.table !== 'string' || typeof result.affectedRows !== 'number') {
+    throw new Error('The previous idempotent mutation stored an invalid result.')
+  }
+  return {
+    operation: result.operation as MutationPlan['operation'], table: result.table, affectedRows: result.affectedRows,
+    ...(typeof result.insertId === 'number' ? { insertId: result.insertId } : {}),
+  }
+}
+
+export async function executeMutation(db: DatabaseClient, plan: MutationPlan, policy: MutationPolicy, options: MutationExecutionOptions = {}): Promise<MutationExecutionResult> {
+  const profileName = options.profileName ?? 'default'
+  if (profileName.length < 1 || profileName.length > 255) throw new Error('Profile name must be 1-255 characters for idempotent execution.')
+  const planFingerprint = mutationPlanFingerprint(profileName, plan, policy)
+  validateMutationExecution(policy, true, options.approvalToken, options.confirmFingerprint, planFingerprint)
+  validateIdempotencyKey(plan, options.idempotencyKey)
   const compiled = compileMutationPlan(plan, policy)
-  return db.transaction(async (transaction) => {
+  const executeTransaction = () => db.transaction(async (transaction) => {
+    let ownerToken: string | undefined
+    if (options.idempotencyKey) {
+      ownerToken = randomUUID()
+      const claim = await transaction.execute(`insert ignore into \`__sakura_database_idempotency\`
+        (profile_name, idempotency_key, plan_fingerprint, owner_token)
+        values (?, ?, ?, ?)`, [profileName, options.idempotencyKey, planFingerprint, ownerToken])
+      if (claim.affectedRows !== 1) {
+        const record = (await transaction.execute(`select plan_fingerprint, result_json
+          from \`__sakura_database_idempotency\` where profile_name = ? and idempotency_key = ?`, [profileName, options.idempotencyKey])).rows[0]
+        if (!record || record.plan_fingerprint !== planFingerprint) throw new Error('Idempotency key was already used for a different mutation plan.')
+        if (record.result_json === null || record.result_json === undefined) throw new Error('The previous idempotent mutation did not store a result.')
+        const stored = typeof record.result_json === 'string' ? JSON.parse(record.result_json) : record.result_json
+        return { ...parseStoredMutationResult(stored), idempotentReplay: true }
+      }
+    }
     const result = await transaction.execute(compiled.sql, compiled.parameters)
     const affectedRows = result.affectedRows ?? 0
     if (affectedRows > compiled.maximumAffectedRows) throw new Error(`Mutation exceeded the affected-row limit of ${compiled.maximumAffectedRows}; transaction rolled back.`)
-    return { operation: plan.operation, table: plan.table, affectedRows, insertId: result.insertId }
+    if (plan.operation !== 'insert' && plan.optimisticLock && affectedRows === 0) throw new Error('The target row changed since preview; transaction rolled back.')
+    const mutationResult = { operation: plan.operation, table: plan.table, affectedRows, insertId: result.insertId }
+    if (options.idempotencyKey && ownerToken) {
+      await transaction.execute(`update \`__sakura_database_idempotency\` set result_json = ?
+        where profile_name = ? and idempotency_key = ? and owner_token = ?`, [JSON.stringify(mutationResult), profileName, options.idempotencyKey, ownerToken])
+      return { ...mutationResult, idempotentReplay: false }
+    }
+    return mutationResult
   })
+  try {
+    return await executeTransaction()
+  } catch (error) {
+    if (!options.idempotencyKey || !isMissingIdempotencyStore(error) || !db.ensureIdempotencyStore) throw error
+    await db.ensureIdempotencyStore()
+    return executeTransaction()
+  }
 }

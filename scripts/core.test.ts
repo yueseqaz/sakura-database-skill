@@ -104,4 +104,5 @@ test('enforces table, column, and required-filter profile policies', () => {
     where: { or: [{ column: 'tenant_id', op: '=', value: 7 }, { column: 'status', op: '=', value: 'open' }] },
   }, { requiredFilters: { orders: ['tenant_id'] } }), /required filter/)
   assert.throws(() => validatePlanPolicy(plan, { allowedTables: ['customers'] }), /not allowed/)
+  assert.throws(() => validatePlanPolicy({ table: '__sakura_database_idempotency', columns: ['*'] }, {}), /reserved internal table/i)
 })

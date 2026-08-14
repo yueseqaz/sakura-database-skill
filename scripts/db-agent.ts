@@ -66,7 +66,7 @@ Configuration:
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
 
-Mutation execution: mutate --file <plan.json> --profile name --execute --approve token --confirm fingerprint
+Mutation execution: mutate --file <plan.json> --profile name --execute --approve token --confirm fingerprint [--idempotency-key key]
 Common options: --profile name --config path --approve token --format json|table|csv
 Environment: DATABASE_URL=mysql://user:password@host:3306/database`)
 }
@@ -165,13 +165,16 @@ async function run(): Promise<void> {
       const approvalToken = stringValue(args.values, 'approve')
       const profileName = resolvedProfile?.name ?? 'environment'
       const confirmFingerprint = stringValue(args.values, 'confirm')
+      const idempotencyKey = stringValue(args.values, 'idempotency-key')
       validateMutationExecution(profile, execute, approvalToken, confirmFingerprint, mutationPlanFingerprint(profileName, plan, profile))
       validateMutationSchema(plan, await executeWithTimeout(discoverTables(db, [plan.table]), profile.timeoutMs))
       const compiled = compileMutationPlan(plan, profile)
       fingerprint = fingerprintStatement(compiled.sql)
       action = `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`
       if (execute) {
-        const mutation = await executeWithTimeout(executeMutation(db, plan, profile, approvalToken, confirmFingerprint, profileName), profile.timeoutMs)
+        const mutation = await executeWithTimeout(executeMutation(db, plan, profile, {
+          approvalToken, confirmFingerprint, profileName, idempotencyKey,
+        }), profile.timeoutMs)
         rowCount = mutation.affectedRows
         result = { mode: 'executed', ...mutation }
       } else {

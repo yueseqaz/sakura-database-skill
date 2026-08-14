@@ -44,6 +44,12 @@ export interface Policy {
   maxAffectedRows?: number
 }
 
+export const INTERNAL_IDEMPOTENCY_TABLE = '__sakura_database_idempotency'
+
+export function assertUserTable(table: string): void {
+  if (table === INTERNAL_IDEMPOTENCY_TABLE) throw new Error(`Reserved internal table cannot be accessed: ${table}`)
+}
+
 const DEFAULT_SENSITIVE_COLUMNS = [
   'password', 'salt', 'secret', 'token', 'api_key', 'apikey', 'email', 'phone', 'mobile',
   'id_card', 'identity', 'resume', 'medical', 'birth',
@@ -58,6 +64,8 @@ function identifier(value: string, dialect: DialectName = 'mysql', allowStar = f
 
 export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRows'> = {}, dialect: DialectName = 'mysql') {
   if (!Array.isArray(plan.columns) || plan.columns.length === 0) throw new Error('Select plans require at least one column.')
+  assertUserTable(plan.table)
+  for (const join of plan.joins ?? []) assertUserTable(join.table)
   const maxRows = Math.max(1, Math.min(policy.maxRows ?? 100, 10_000))
   const limit = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
   const offset = Math.max(0, plan.offset ?? 0)
@@ -170,6 +178,7 @@ export function validatePlanPolicy(plan: SelectPlan, policy: Policy): void {
   for (const join of plan.joins ?? []) aliases.set(join.as ?? join.table, join.table)
   const tables = [plan.table, ...(plan.joins ?? []).map((join) => join.table)]
   for (const table of tables) {
+    assertUserTable(table)
     if (policy.allowedTables && !policy.allowedTables.includes(table)) throw new Error(`Table is not allowed by policy: ${table}`)
     if (policy.deniedTables?.includes(table)) throw new Error(`Table is denied by policy: ${table}`)
   }
