@@ -33,13 +33,15 @@ const policyFields = {
   sensitiveColumns: z.array(z.string().min(1)).optional(),
   requireApproval: z.boolean().optional(),
   allowSensitive: z.boolean().optional(),
-  allowRawSql: z.boolean().optional(),
   allowedTables: z.array(z.string().min(1)).optional(),
   deniedTables: z.array(z.string().min(1)).optional(),
   allowedColumns: z.record(z.string(), z.array(z.string().min(1))).optional(),
   deniedColumns: z.record(z.string(), z.array(z.string().min(1))).optional(),
   requiredFilters: z.record(z.string(), z.array(z.string().min(1))).optional(),
   maxEstimatedRows: z.number().int().positive().optional(),
+  allowWrites: z.boolean().optional(),
+  allowDelete: z.boolean().optional(),
+  maxAffectedRows: z.number().int().min(1).max(10_000).optional(),
 }
 
 const sshTunnelSchema = z.object({
@@ -53,7 +55,7 @@ const sshTunnelSchema = z.object({
 }).strict()
 
 const profileSchema = z.object({
-  dialect: z.enum(['postgres', 'mysql', 'mariadb', 'sqlite']),
+  dialect: z.literal('mysql'),
   url: z.string().min(1).optional(),
   urlEnv: z.string().min(1).optional(),
   sshTunnel: sshTunnelSchema.optional(),
@@ -82,11 +84,12 @@ export async function writeExampleConfig(path = defaultConfigPath()): Promise<vo
   const config: AgentConfig = {
     profiles: {
       development: {
-        dialect: 'postgres',
+        dialect: 'mysql',
         urlEnv: 'DATABASE_URL',
         environment: 'development',
         maxRows: 100,
         timeoutMs: 10_000,
+        allowWrites: false,
       },
       production: {
         dialect: 'mysql',
@@ -95,6 +98,7 @@ export async function writeExampleConfig(path = defaultConfigPath()): Promise<vo
         maxRows: 50,
         timeoutMs: 5_000,
         requireApproval: true,
+        allowWrites: false,
       },
     },
   }
@@ -110,9 +114,9 @@ export function resolveProfile(config: AgentConfig, name: string | undefined): {
 }
 
 export function resolveConnection(profile: Profile | undefined): { dialect: DialectName; url: string } {
-  const dialect = profile?.dialect ?? process.env.DB_DIALECT as DialectName | undefined
+  const dialect = profile?.dialect ?? (process.env.DB_DIALECT || 'mysql') as DialectName
   const url = profile?.url ?? (profile?.urlEnv ? process.env[profile.urlEnv] : process.env.DATABASE_URL)
-  if (!dialect || !['postgres', 'mysql', 'mariadb', 'sqlite'].includes(dialect)) throw new Error('Set DB_DIALECT or use a profile with postgres, mysql, mariadb, or sqlite.')
+  if (dialect !== 'mysql') throw new Error('This version only supports MySQL.')
   if (!url) throw new Error('Set DATABASE_URL or configure a profile urlEnv.')
   return { dialect, url }
 }

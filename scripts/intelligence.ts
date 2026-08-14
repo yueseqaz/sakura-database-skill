@@ -35,11 +35,9 @@ export function paginatePlan(plan: SelectPlan, fetchedCount: number) {
 }
 
 export function assessExplain(dialect: DialectName, rows: Array<Record<string, unknown>>, maxEstimatedRows = 10_000) {
-  const text = rows.map((row) => Object.values(row).join(' ')).join(' ').toLowerCase()
-  const fullScan = dialect === 'mysql' || dialect === 'mariadb' ? rows.some((row) => String(row.type).toUpperCase() === 'ALL') : dialect === 'postgres' ? text.includes('seq scan') : text.includes('scan') && !text.includes('using index')
+  const fullScan = rows.some((row) => String(row.type).toUpperCase() === 'ALL')
   const structuredEstimates = rows.map((row) => Number(row.rows ?? 0)).filter(Number.isFinite)
-  const textEstimates = dialect === 'postgres' ? [...text.matchAll(/rows=(\d+)/g)].map((match) => Number(match[1])) : []
-  const estimate = Math.max(0, ...structuredEstimates, ...textEstimates)
+  const estimate = Math.max(0, ...structuredEstimates)
   const reasons = [
     ...(fullScan ? ['full table scan'] : []),
     ...(estimate >= maxEstimatedRows ? [`estimated ${estimate} rows`] : []),

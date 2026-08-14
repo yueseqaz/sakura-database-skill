@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
-import { compileSelectPlan, makeExplainStatement, maskRows, safeStatement, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateRawSqlAccess, validateSensitiveAccess } from './core.js'
+import { compileSelectPlan, maskRows, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { defaultAuditPath, fingerprintStatement, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
-import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
+import { connect, discover, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 import { doctor } from './doctor.js'
+import { compileMutationPlan, executeMutation, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
 
-type Command = 'discover' | 'summary' | 'assess' | 'query' | 'plan' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
+type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
 type OutputFormat = 'json' | 'table' | 'csv'
 
 interface Args {
@@ -38,7 +39,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   const help = command === '--help' || command === '-h' || values.help === true
-  if (command && !['discover', 'summary', 'assess', 'query', 'plan', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
+  if (command && !['discover', 'summary', 'assess', 'plan', 'mutate', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
     throw new Error(`Unknown command: ${command}`)
   }
   return { command: command as Command | undefined, values, positionals, help }
@@ -47,15 +48,15 @@ function parseArgs(argv: string[]): Args {
 function usage(): void {
   console.log(`Usage: db-agent <command> [options]
 
-Read-only commands:
+Database commands:
   health                         Check connectivity.
   stats                          Summarize tables and estimated storage.
   discover [--table name]        Discover tables and columns.
   summary [--table name]         Summarize table and sensitive-column counts.
-  assess --sql <statement>       Explain and rate read-query cost.
-  query --sql <statement>        Run one limited read-only statement.
   plan --file <plan.json>        Run a parameterized SelectPlan.
-  explain --sql <statement>      Inspect a read-only query plan.
+  explain --file <plan.json>     Inspect a SelectPlan execution plan.
+  assess --file <plan.json>      Explain and rate a SelectPlan's cost.
+  mutate --file <plan.json>      Preview an Insert/Update/Delete MutationPlan.
   indexes --table name            List table indexes.
   relations [--table name]       List foreign-key relationships.
 
@@ -64,8 +65,9 @@ Configuration:
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
 
+Mutation execution: mutate --file <plan.json> --profile name --execute --approve token
 Common options: --profile name --config path --approve token --format json|table|csv
-Environment: DB_DIALECT=postgres|mysql|mariadb|sqlite DATABASE_URL=<connection URL>`)
+Environment: DATABASE_URL=mysql://user:password@host:3306/database`)
 }
 
 function stringValue(values: Args['values'], name: string): string | undefined {
@@ -96,11 +98,6 @@ function schemaTables(entries: Awaited<ReturnType<typeof discover>>): SchemaTabl
   return entries.map((table) => ({ name: table.name, columns: table.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) }))
 }
 
-function assertRawQueryIsBounded(statement: string): void {
-  if (/\b(count|sum|avg|min|max)\s*\(/i.test(statement)) return
-  if (!/\blimit\s+\d+/i.test(statement)) throw new Error('Raw queries must include LIMIT. Use a SelectPlan to receive an automatic cap.')
-}
-
 async function run(): Promise<void> {
   const args = parseArgs(process.argv.slice(2))
   if (args.help || !args.command) return usage()
@@ -129,7 +126,7 @@ async function run(): Promise<void> {
   }
 
   const resolvedProfile = resolveProfile(config, stringValue(args.values, 'profile'))
-  const profile: Profile = resolvedProfile?.profile ?? { dialect: process.env.DB_DIALECT as Profile['dialect'] }
+  const profile: Profile = resolvedProfile?.profile ?? { dialect: 'mysql' }
 
   const { dialect, url } = resolveConnection(resolvedProfile?.profile)
   validatePolicy(profile, { action: args.command, approvalToken: stringValue(args.values, 'approve') })
@@ -150,29 +147,43 @@ async function run(): Promise<void> {
     else if (args.command === 'summary') {
       const tables = schemaTables(await executeWithTimeout(discover(db, stringValue(args.values, 'table')), profile.timeoutMs))
       result = summarizeSchema(tables)
-    } else if (args.command === 'assess') {
-      const source = stringValue(args.values, 'sql')
-      if (!source) throw new Error('assess requires --sql.')
-      const plan = await executeWithTimeout(query(db, makeExplainStatement(dialect, source)), profile.timeoutMs)
-      result = { assessment: assessExplain(dialect, plan.rows as Array<Record<string, unknown>>, profile.maxEstimatedRows), plan: plan.rows }
-    }
-    else if (args.command === 'indexes') {
+    } else if (args.command === 'indexes') {
       const table = stringValue(args.values, 'table')
       if (!table) throw new Error('indexes requires --table.')
       result = await executeWithTimeout(indexes(db, dialect, table), profile.timeoutMs)
     } else if (args.command === 'relations') result = await executeWithTimeout(relationships(db, dialect, stringValue(args.values, 'table')), profile.timeoutMs)
+    else if (args.command === 'mutate') {
+      const file = stringValue(args.values, 'file')
+      if (!file) throw new Error('mutate requires --file <plan.json>.')
+      const plan = JSON.parse(await readFile(file, 'utf8')) as MutationPlan
+      const execute = args.values.execute === true
+      const approvalToken = stringValue(args.values, 'approve')
+      validateMutationExecution(profile, execute, approvalToken)
+      validateMutationSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
+      const compiled = compileMutationPlan(plan, profile)
+      fingerprint = fingerprintStatement(compiled.sql)
+      action = `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`
+      if (execute) {
+        const mutation = await executeWithTimeout(executeMutation(db, plan, profile, approvalToken), profile.timeoutMs)
+        rowCount = mutation.affectedRows
+        result = { mode: 'executed', ...mutation }
+      } else {
+        const preview = await executeWithTimeout(previewMutation(db, plan, profile), profile.timeoutMs)
+        rowCount = preview.estimatedRows
+        result = { mode: 'preview', ...preview }
+      }
+    }
     else {
-      let statement: string
+      const file = stringValue(args.values, 'file')
+      if (!file) throw new Error(`${args.command} requires --file <plan.json>.`)
+      const plan = JSON.parse(await readFile(file, 'utf8')) as SelectPlan
+      const compiledPlan = compileSelectPlan(plan, profile, dialect)
+      validatePlanSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
+      validatePlanPolicy(plan, profile)
+      fingerprint = fingerprintStatement(compiledPlan.sql)
+      action = `${args.command}:${plan.table}`
       if (args.command === 'plan') {
-        const file = stringValue(args.values, 'file')
-        if (!file) throw new Error('plan requires --file <plan.json>.')
-        const plan = JSON.parse(await readFile(file, 'utf8')) as SelectPlan
-        const compiledPlan = compileSelectPlan(plan, profile, dialect)
-        validatePlanSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
-        validatePlanPolicy(plan, profile)
         validateSensitiveAccess(profile, args.values['include-sensitive'] === true)
-        fingerprint = fingerprintStatement(compiledPlan.sql)
-        action = `plan:${plan.table}`
         const pageSize = Math.max(1, Math.min(plan.limit ?? profile.maxRows ?? 100, profile.maxRows ?? 100))
         const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize }, { ...profile, fetchExtra: true }), profile.timeoutMs)
         const pagination = paginatePlan({ ...plan, limit: pageSize }, queryResult.rows.length)
@@ -180,32 +191,13 @@ async function run(): Promise<void> {
         rowCount = pageRows.length
         const rows = args.values['include-sensitive'] === true ? pageRows : maskRows(pageRows as Array<Record<string, unknown>>, profile.sensitiveColumns)
         result = { rows, rowCount, page: pagination }
-        await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
-        output(result, format)
-        return
       } else {
-        const source = stringValue(args.values, 'sql')
-        if (!source) throw new Error(`${args.command} requires --sql.`)
-        statement = safeStatement(source, dialect)
-        if (args.command === 'query') {
-          validateRawSqlAccess(profile)
-          assertRawQueryIsBounded(statement)
-        }
-        fingerprint = fingerprintStatement(statement)
-        if (args.command === 'query' && args.values.check === true) {
-          const explainResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), profile.timeoutMs)
-          const assessment = assessExplain(dialect, explainResult.rows as Array<Record<string, unknown>>, profile.maxEstimatedRows)
-          if (assessment.requiresApproval && args.values['allow-scan'] !== true) {
-            throw new Error(`Query blocked: ${assessment.reasons.join(', ')}. Re-run with --allow-scan after review.`)
-          }
-        }
-        if (args.command === 'explain' && !/^explain\b/i.test(statement)) statement = dialect === 'sqlite' ? `EXPLAIN QUERY PLAN ${statement}` : `EXPLAIN ${statement}`
+        const explained = await executeWithTimeout(explainPlan(db, plan, profile), profile.timeoutMs)
+        rowCount = explained.rows.length
+        result = args.command === 'assess'
+          ? { assessment: assessExplain(dialect, explained.rows, profile.maxEstimatedRows), plan: explained.rows }
+          : { rows: explained.rows, rowCount }
       }
-      const queryResult = await executeWithTimeout(query(db, statement), profile.timeoutMs)
-      rowCount = queryResult.rows.length
-      validateSensitiveAccess(profile, args.values['include-sensitive'] === true)
-      const rows = args.values['include-sensitive'] === true ? queryResult.rows : maskRows(queryResult.rows as Array<Record<string, unknown>>, profile.sensitiveColumns)
-      result = { rows, rowCount }
     }
     await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
     output(result, format)

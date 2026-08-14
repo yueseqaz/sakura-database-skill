@@ -1,19 +1,21 @@
 ---
 name: database-agent
-description: Use when Codex needs to connect to local or remote MySQL, MariaDB, PostgreSQL, or SQLite databases; discover schemas, inspect relations and indexes, run constrained read-only queries, diagnose query plans, or invoke the database MCP server. Use for safe database analysis and data lookup with credentials supplied through environment variables or configured profiles.
+description: Use when Codex needs safe access to a local or remote MySQL database for schema discovery, constrained data lookup, controlled inserts or updates, approved deletes, EXPLAIN analysis, or database MCP operations.
 ---
 
 # Database Agent
 
-Use the TypeScript CLI or MCP server for database work. Convert natural-language requests into a minimal `SelectPlan`; do not pass user values through raw SQL.
+Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language requests into a minimal `SelectPlan` or `MutationPlan`. The tool does not accept raw SQL.
 
 ## Workflow
 
 1. Run `summary` to orient within a large database, then `discover --table <name>` and, when needed, `relations --table <name>` before querying an unfamiliar table.
 2. State the selected table, columns, filters, expected row count, and sensitivity before executing.
-3. Convert the user's request into a minimal Query Plan using the observed schema. The CLI does not interpret natural language. Use raw `query --sql` only for bounded, read-only expert analysis.
-4. Run `assess --sql` or `query --check` before a potentially expensive query. Check `indexes` when it scans unexpectedly. Honor table, column, and required-filter profile policies.
+3. Convert the user's request into a minimal Query Plan using the observed schema. The CLI does not interpret natural language and has no raw SQL command.
+4. Run `assess --file <plan.json>` before a potentially expensive plan. Check `indexes` when it scans unexpectedly. Honor table, column, and required-filter profile policies.
 5. Return only fields needed for the task. Keep default masking enabled.
+
+For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Execute only after the user approves the preview, using `execute: true` and the supplied approval token. Never invent an approval token.
 
 ```json
 {
@@ -28,19 +30,23 @@ Use the TypeScript CLI or MCP server for database work. Convert natural-language
 npm run db-agent -- discover --table orders
 npm run db-agent -- summary --table orders
 npm run db-agent -- plan --file plan.json --profile development
-npm run db-agent -- assess --sql 'select id from orders limit 50'
-npm run db-agent -- explain --sql 'select id from orders where customer_id = 42 limit 50'
+npm run db-agent -- assess --file plan.json
+npm run db-agent -- explain --file plan.json
+npm run db-agent -- mutate --file mutation.json --profile writer
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024
 ```
 
 ## Profiles And Security
 
 - Use profiles for remote or production databases. Credentials must be supplied by `urlEnv`, not committed to a profile.
-- A production profile requires `--approve <ticket-or-token>` unless its policy explicitly disables that requirement.
-- Treat `allowedTables`, `allowedColumns`, `deniedColumns`, `requiredFilters`, and `allowRawSql` as hard boundaries.
+- Every mutation execution requires `--approve <ticket-or-token>`. Never reuse or invent approval.
+- Treat `allowedTables`, `allowedColumns`, `deniedColumns`, and `requiredFilters` as hard boundaries.
 - Use `--include-sensitive` only when the profile sets `allowSensitive: true` and the user explicitly authorizes disclosure.
-- Use a least-privilege read-only account. Do not expose passwords, salts, tokens, phone numbers, email addresses, resumes, medical data, or raw audit logs unless explicitly authorized.
+- Prefer separate least-privilege read-only and writer profiles. Keep `allowWrites` false unless writes are required; enable `allowDelete` separately and set a small `maxAffectedRows`.
+- Do not expose passwords, salts, tokens, phone numbers, email addresses, resumes, medical data, or raw audit logs unless explicitly authorized.
 - SSH tunnels are configured per profile and are closed after the command.
+- Use only `mysql://` connection URLs. This version intentionally does not support other database engines.
 
 ## MCP
 
-Run `npm run mcp` for stdio integration. Call `database_query_plan` for data access, not a free-form SQL tool. MCP and CLI use the same schema validation, profile policy, masking, timeout, pagination, risk assessment, and audit controls. Construct the Query Plan in the agent after inspecting schema metadata.
+Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same schema validation, profile policy, limits, approval, transactions, rollback, masking, and audit controls.

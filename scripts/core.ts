@@ -1,7 +1,4 @@
-import { createRequire } from 'node:module'
-import type { Parser as SqlParser } from 'node-sql-parser'
-
-export type DialectName = 'postgres' | 'mysql' | 'mariadb' | 'sqlite'
+export type DialectName = 'mysql'
 export type QueryOperator = '=' | '!=' | '<>' | '>' | '>=' | '<' | '<=' | 'like' | 'in' | 'not in' | 'between' | 'is null' | 'is not null'
 export type AggregateFunction = 'count' | 'sum' | 'avg' | 'min' | 'max'
 export type FieldExpression = string | { aggregate: AggregateFunction; column?: string }
@@ -36,13 +33,15 @@ export interface Policy {
   sensitiveColumns?: string[]
   requireApproval?: boolean
   allowSensitive?: boolean
-  allowRawSql?: boolean
   allowedTables?: string[]
   deniedTables?: string[]
   allowedColumns?: Record<string, string[]>
   deniedColumns?: Record<string, string[]>
   requiredFilters?: Record<string, string[]>
   maxEstimatedRows?: number
+  allowWrites?: boolean
+  allowDelete?: boolean
+  maxAffectedRows?: number
 }
 
 const DEFAULT_SENSITIVE_COLUMNS = [
@@ -54,8 +53,7 @@ function identifier(value: string, dialect: DialectName = 'mysql', allowStar = f
   if (allowStar && value === '*') return '*'
   const parts = value.split('.')
   if (parts.length > 2 || parts.some((part) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part))) throw new Error(`Unsafe identifier: ${value}`)
-  const quote = dialect === 'postgres' ? '"' : '`'
-  return parts.map((part) => `${quote}${part}${quote}`).join('.')
+  return parts.map((part) => `\`${part}\``).join('.')
 }
 
 export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRows'> = {}, dialect: DialectName = 'mysql') {
@@ -64,10 +62,8 @@ export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRow
   const limit = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
   const offset = Math.max(0, plan.offset ?? 0)
   const parameters: unknown[] = []
-  let placeholder = 0
   const bind = (value: unknown) => {
     parameters.push(value)
-    if (dialect === 'postgres') return `$${++placeholder}`
     return '?'
   }
 
@@ -158,19 +154,14 @@ export function validatePolicy(policy: Policy, input: { action: string; approval
   if (policy.maxEstimatedRows !== undefined && (!Number.isInteger(policy.maxEstimatedRows) || policy.maxEstimatedRows < 1)) {
     throw new Error('maxEstimatedRows must be a positive integer.')
   }
+  if (policy.maxAffectedRows !== undefined && (!Number.isInteger(policy.maxAffectedRows) || policy.maxAffectedRows < 1 || policy.maxAffectedRows > 10_000)) {
+    throw new Error('maxAffectedRows must be an integer between 1 and 10000.')
+  }
 }
 
 export function validateSensitiveAccess(policy: Pick<Policy, 'allowSensitive'>, requested: boolean): void {
   if (requested && policy.allowSensitive !== true) {
     throw new Error('Sensitive results require allowSensitive: true in the selected profile.')
-  }
-}
-
-export function validateRawSqlAccess(policy: Policy): void {
-  if (policy.allowRawSql === false) throw new Error('Raw SQL is disabled by the selected profile.')
-  const hasStructuredPolicy = Boolean(policy.allowedTables || policy.deniedTables || policy.allowedColumns || policy.deniedColumns || policy.requiredFilters)
-  if (hasStructuredPolicy && policy.allowRawSql !== true) {
-    throw new Error('Raw SQL must be explicitly enabled when structured table or column policies are configured.')
   }
 }
 
@@ -282,53 +273,4 @@ export function validatePlanSchema(plan: SelectPlan, tables: ObservedTable[]): v
   if (plan.having) validateFilter(plan.having)
   for (const column of plan.groupBy ?? []) validateColumn(column)
   for (const order of plan.orderBy ?? []) validateColumn(order.column)
-}
-
-const { Parser } = createRequire(import.meta.url)('node-sql-parser') as { Parser: new () => SqlParser }
-const sqlParser = new Parser()
-const parserDialect: Record<DialectName, string> = { mysql: 'MySQL', mariadb: 'MariaDB', postgres: 'Postgresql', sqlite: 'Sqlite' }
-const modifyingNodeTypes = new Set(['insert', 'update', 'delete', 'replace', 'create', 'alter', 'drop', 'truncate', 'grant', 'revoke', 'call'])
-
-function assertReadOnlyAst(value: unknown): void {
-  if (!value || typeof value !== 'object') return
-  if (Array.isArray(value)) {
-    for (const item of value) assertReadOnlyAst(item)
-    return
-  }
-  const node = value as Record<string, unknown>
-  if (typeof node.type === 'string' && modifyingNodeTypes.has(node.type.toLowerCase())) {
-    throw new Error('SQL must be read-only.')
-  }
-  if (node.type === 'select' && node.into && typeof node.into === 'object' && (node.into as Record<string, unknown>).position) {
-    throw new Error('SELECT INTO is not read-only.')
-  }
-  for (const child of Object.values(node)) assertReadOnlyAst(child)
-}
-
-export function safeStatement(statement: string, dialect: DialectName = 'mysql'): string {
-  const normalized = statement.trim().replace(/;\s*$/, '')
-  if (!normalized || /;/.test(normalized)) throw new Error('Provide exactly one SQL statement without an internal semicolon.')
-  const explainMatch = normalized.match(/^explain(?:\s+query\s+plan)?\s+([\s\S]+)$/i)
-  const parsedStatement = explainMatch?.[1] ?? normalized
-  try {
-    const ast = sqlParser.astify(parsedStatement, { database: parserDialect[dialect] }) as unknown
-    if (Array.isArray(ast)) {
-      if (ast.length !== 1) throw new Error('Provide exactly one SQL statement.')
-    } else if (!ast || typeof ast !== 'object') {
-      throw new Error('SQL must be read-only.')
-    }
-    const root = (Array.isArray(ast) ? ast[0] : ast) as Record<string, unknown>
-    if (root.type !== 'select') throw new Error('SQL must be read-only.')
-    assertReadOnlyAst(root)
-  } catch (error) {
-    if (error instanceof Error && /read-only|exactly one/.test(error.message)) throw error
-    throw new Error(`Invalid or unsupported read-only SQL for ${dialect}.`)
-  }
-  return normalized
-}
-
-export function makeExplainStatement(dialect: DialectName, statement: string): string {
-  const readOnly = safeStatement(statement, dialect)
-  if (/^explain\b/i.test(readOnly)) return readOnly
-  return dialect === 'sqlite' ? `EXPLAIN QUERY PLAN ${readOnly}` : `EXPLAIN ${readOnly}`
 }

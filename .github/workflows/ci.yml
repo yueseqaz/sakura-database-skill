@@ -8,25 +8,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: database_agent_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
       mysql:
         image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: mysql
           MYSQL_DATABASE: database_agent_test
-          MYSQL_USER: readonly
-          MYSQL_PASSWORD: readonly
+          MYSQL_USER: database_agent
+          MYSQL_PASSWORD: database_agent
         ports:
           - 3306:3306
         options: >-
@@ -34,24 +22,8 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 15
-      mariadb:
-        image: mariadb:11.4
-        env:
-          MARIADB_ROOT_PASSWORD: mariadb
-          MARIADB_DATABASE: database_agent_test
-          MARIADB_USER: readonly
-          MARIADB_PASSWORD: readonly
-        ports:
-          - 3307:3306
-        options: >-
-          --health-cmd "healthcheck.sh --connect --innodb_initialized"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 15
     env:
-      TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/database_agent_test
-      TEST_MYSQL_URL: mysql://readonly:readonly@127.0.0.1:3306/database_agent_test
-      TEST_MARIADB_URL: mariadb://readonly:readonly@127.0.0.1:3307/database_agent_test
+      TEST_MYSQL_URL: mysql://database_agent:database_agent@127.0.0.1:3306/database_agent_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

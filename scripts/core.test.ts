@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { compileSelectPlan, maskRows, safeStatement, validatePlanPolicy, validatePlanSchema, validatePolicy, validateRawSqlAccess, validateSensitiveAccess } from './core.js'
+import { compileSelectPlan, maskRows, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 
 test('compiles a structured select plan with bound values and a capped limit', () => {
   const compiled = compileSelectPlan({
@@ -31,12 +31,6 @@ test('masks sensitive result fields by default', () => {
 test('requires an explicit approval token for protected profiles', () => {
   assert.throws(() => validatePolicy({ environment: 'production' }, { action: 'query', approvalToken: undefined }), /approval token/)
   assert.doesNotThrow(() => validatePolicy({ environment: 'production' }, { action: 'query', approvalToken: 'approved' }))
-})
-
-test('parses SQL and rejects write-capable CTEs and SELECT INTO', () => {
-  assert.equal(safeStatement('with recent as (select id from users) select id from recent', 'postgres'), 'with recent as (select id from users) select id from recent')
-  assert.throws(() => safeStatement('with changed as (update users set active = false returning id) select id from changed', 'postgres'), /read-only/i)
-  assert.throws(() => safeStatement('select id into copied_users from users', 'postgres'), /read-only/i)
 })
 
 test('validates plans against observed tables and columns', () => {
@@ -72,9 +66,9 @@ test('compiles nested filters, aggregates, grouping, HAVING, and a controlled jo
     having: { column: { aggregate: 'count', column: 'o.id' }, op: '>', value: 1 },
     orderBy: [{ column: 'o.customer_id', direction: 'asc' }],
     limit: 50,
-  }, { maxRows: 100 }, 'postgres')
+  }, { maxRows: 100 }, 'mysql')
 
-  assert.equal(compiled.sql, 'select "o"."customer_id" as "customer_id", COUNT("o"."id") as "order_count" from "orders" as "o" left join "customers" as "c" on "o"."customer_id" = "c"."id" where ("o"."status" IN ($1, $2) and ("c"."deleted_at" IS NULL or "o"."created_at" BETWEEN $3 AND $4)) group by "o"."customer_id" having COUNT("o"."id") > $5 order by "o"."customer_id" ASC limit $6')
+  assert.equal(compiled.sql, 'select `o`.`customer_id` as `customer_id`, COUNT(`o`.`id`) as `order_count` from `orders` as `o` left join `customers` as `c` on `o`.`customer_id` = `c`.`id` where (`o`.`status` IN (?, ?) and (`c`.`deleted_at` IS NULL or `o`.`created_at` BETWEEN ? AND ?)) group by `o`.`customer_id` having COUNT(`o`.`id`) > ? order by `o`.`customer_id` ASC limit ?')
   assert.deepEqual(compiled.parameters, ['paid', 'shipped', '2026-01-01', '2026-12-31', 1, 50])
 })
 
@@ -93,7 +87,7 @@ test('validates joined plans against observed schema aliases', () => {
   }, schema), /Unknown column/)
 })
 
-test('enforces table, column, required-filter, and raw SQL profile policies', () => {
+test('enforces table, column, and required-filter profile policies', () => {
   const plan = {
     table: 'orders', columns: ['id', 'status'],
     where: [{ column: 'tenant_id', op: '=' as const, value: 7 }],
@@ -110,8 +104,4 @@ test('enforces table, column, required-filter, and raw SQL profile policies', ()
     where: { or: [{ column: 'tenant_id', op: '=', value: 7 }, { column: 'status', op: '=', value: 'open' }] },
   }, { requiredFilters: { orders: ['tenant_id'] } }), /required filter/)
   assert.throws(() => validatePlanPolicy(plan, { allowedTables: ['customers'] }), /not allowed/)
-  assert.throws(() => validateRawSqlAccess({ allowRawSql: false }), /disabled/)
-  assert.throws(() => validateRawSqlAccess({ allowedTables: ['orders'] }), /explicitly enabled/)
-  assert.doesNotThrow(() => validateRawSqlAccess({}))
-  assert.doesNotThrow(() => validateRawSqlAccess({ allowedTables: ['orders'], allowRawSql: true }))
 })

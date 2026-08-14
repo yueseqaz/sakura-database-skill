@@ -1,6 +1,6 @@
 {
   "name": "sakura-database-skill",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "A universal database skill and TypeScript CLI for AI agents.",
   "private": false,
   "type": "module",
@@ -31,17 +31,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "better-sqlite3": "^12.4.1",
-    "kysely": "^0.28.8",
     "mysql2": "^3.15.1",
-    "node-sql-parser": "^5.3.8",
-    "pg": "^8.16.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.3.0",
-    "@types/pg": "^8.15.5",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   }

@@ -1,22 +1,34 @@
-import Database from 'better-sqlite3'
-import { CompiledQuery, Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely'
-import { createPool } from 'mysql2'
-import { Pool } from 'pg'
+import { createPool, type Pool, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise'
 import type { DialectName } from './core.js'
 import { compileSelectPlan, type Policy, type SelectPlan } from './core.js'
 
-export type DatabaseClient = Kysely<Record<string, never>>
-
-function sqlitePath(url: string): string {
-  return url.startsWith('sqlite://') ? decodeURIComponent(url.slice('sqlite://'.length)) : url
+export interface DatabaseResult {
+  rows: Array<Record<string, unknown>>
+  affectedRows?: number
+  insertId?: number
 }
 
-function mysqlPoolFromUrl(url: string, timeoutMs: number, dialect: 'mysql' | 'mariadb') {
+export interface TransactionClient {
+  execute(statement: string, parameters?: unknown[]): Promise<DatabaseResult>
+}
+
+export interface DatabaseClient extends TransactionClient {
+  transaction<T>(run: (transaction: TransactionClient) => Promise<T>): Promise<T>
+  destroy(): Promise<void>
+}
+
+function databaseResult(result: unknown): DatabaseResult {
+  if (Array.isArray(result)) return { rows: result as RowDataPacket[] }
+  const header = result as ResultSetHeader
+  return { rows: [], affectedRows: header.affectedRows, insertId: header.insertId }
+}
+
+function mysqlPoolFromUrl(url: string, timeoutMs: number): Pool {
   const parsed = new URL(url)
-  if (!['mysql:', 'mariadb:'].includes(parsed.protocol)) throw new Error('MySQL and MariaDB DATABASE_URL must start with mysql:// or mariadb://.')
+  if (parsed.protocol !== 'mysql:') throw new Error('DATABASE_URL must start with mysql://.')
   const requestedTimezone = parsed.searchParams.get('timezone') ?? parsed.searchParams.get('serverTimezone')
   const timezone = requestedTimezone && /^(Z|local|[+-]\d{2}:?\d{2})$/.test(requestedTimezone) ? requestedTimezone : undefined
-  const pool = createPool({
+  return createPool({
     host: parsed.hostname,
     port: Number(parsed.port || '3306'),
     user: decodeURIComponent(parsed.username),
@@ -24,18 +36,13 @@ function mysqlPoolFromUrl(url: string, timeoutMs: number, dialect: 'mysql' | 'ma
     database: decodeURIComponent(parsed.pathname.slice(1)),
     timezone,
     multipleStatements: false,
+    connectTimeout: timeoutMs,
+    enableKeepAlive: true,
   })
-  pool.on('connection', (connection) => {
-    const statement = dialect === 'mariadb'
-      ? `SET SESSION tx_read_only = ON, SESSION max_statement_time = ${timeoutMs / 1_000}`
-      : `SET SESSION transaction_read_only = ON, SESSION max_execution_time = ${timeoutMs}`
-    connection.query(statement, (error) => { if (error) connection.destroy() })
-  })
-  return pool
 }
 
 export function withLocalTunnel(url: string, localPort?: number): string {
-  if (!localPort || url.startsWith('sqlite://')) return url
+  if (!localPort) return url
   const parsed = new URL(url)
   parsed.hostname = '127.0.0.1'
   parsed.port = String(localPort)
@@ -43,12 +50,46 @@ export function withLocalTunnel(url: string, localPort?: number): string {
 }
 
 export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): DatabaseClient {
+  if (dialect !== 'mysql') throw new Error('This version only supports MySQL.')
   const boundedTimeout = Math.max(100, Math.min(timeoutMs, 120_000))
-  if (dialect === 'postgres') return new Kysely({ dialect: new PostgresDialect({
-    pool: new Pool({ connectionString: url, options: `-c default_transaction_read_only=on -c statement_timeout=${boundedTimeout}` }),
-  }) })
-  if (dialect === 'mysql' || dialect === 'mariadb') return new Kysely({ dialect: new MysqlDialect({ pool: mysqlPoolFromUrl(url, boundedTimeout, dialect) }) })
-  return new Kysely({ dialect: new SqliteDialect({ database: new Database(sqlitePath(url), { readonly: true }) }) })
+  const pool = mysqlPoolFromUrl(url, boundedTimeout)
+  return {
+    async execute(statement, parameters = []) {
+      const connection = await pool.getConnection()
+      try {
+        await connection.query(`SET SESSION transaction_read_only = ON, SESSION max_execution_time = ${boundedTimeout}`)
+        const [result] = await connection.execute(statement, parameters as never[])
+        return databaseResult(result)
+      } finally {
+        connection.release()
+      }
+    },
+    async transaction(run) {
+      const connection = await pool.getConnection()
+      let transactionTimer: NodeJS.Timeout | undefined
+      try {
+        await connection.query(`SET SESSION transaction_read_only = OFF, SESSION max_execution_time = ${boundedTimeout}`)
+        await connection.beginTransaction()
+        transactionTimer = setTimeout(() => connection.destroy(), boundedTimeout)
+        const transaction: TransactionClient = {
+          async execute(statement, parameters = []) {
+            const [result] = await connection.execute(statement, parameters as never[])
+            return databaseResult(result)
+          },
+        }
+        const value = await run(transaction)
+        await connection.commit()
+        return value
+      } catch (error) {
+        try { await connection.rollback() } catch { /* A destroyed connection has already rolled back. */ }
+        throw error
+      } finally {
+        if (transactionTimer) clearTimeout(transactionTimer)
+        connection.release()
+      }
+    },
+    async destroy() { await pool.end() },
+  }
 }
 
 export async function executeWithTimeout<T>(operation: Promise<T>, timeoutMs = 10_000): Promise<T> {
@@ -64,51 +105,50 @@ export async function executeWithTimeout<T>(operation: Promise<T>, timeoutMs = 1
 }
 
 export async function discover(db: DatabaseClient, tableName?: string) {
-  const tables = await db.introspection.getTables()
-  return tables
-    .filter((table) => !tableName || table.name.toLowerCase().includes(tableName.toLowerCase()))
-    .map((table) => ({
-      name: table.name,
-      schema: table.schema,
-      isView: table.isView,
-      columns: table.columns.map((column) => ({
-        name: column.name,
-        type: column.dataType,
-        nullable: column.isNullable,
-        autoIncrementing: column.isAutoIncrementing,
-        default: column.hasDefaultValue,
-      })),
-    }))
+  const pattern = tableName ? `%${tableName}%` : '%'
+  const { rows } = await db.execute(`
+    select t.table_schema as table_schema, t.table_name as table_name, t.table_type as table_type,
+      c.column_name as column_name, c.data_type as data_type, c.is_nullable as is_nullable,
+      c.extra as extra, c.column_default as column_default
+    from information_schema.tables t
+    join information_schema.columns c
+      on c.table_schema = t.table_schema and c.table_name = t.table_name
+    where t.table_schema = database() and lower(t.table_name) like lower(?)
+    order by t.table_name, c.ordinal_position
+  `, [pattern])
+  const tables = new Map<string, {
+    name: string
+    schema: string
+    isView: boolean
+    columns: Array<{ name: string; type: string; nullable: boolean; autoIncrementing: boolean; default: boolean }>
+  }>()
+  for (const row of rows) {
+    const name = String(row.table_name)
+    const table = tables.get(name) ?? { name, schema: String(row.table_schema), isView: String(row.table_type) === 'VIEW', columns: [] }
+    table.columns.push({
+      name: String(row.column_name),
+      type: String(row.data_type),
+      nullable: String(row.is_nullable) === 'YES',
+      autoIncrementing: String(row.extra).includes('auto_increment'),
+      default: row.column_default !== null,
+    })
+    tables.set(name, table)
+  }
+  return [...tables.values()]
 }
 
 export async function health(db: DatabaseClient): Promise<{ ok: true }> {
-  await sql`select 1 as ok`.execute(db)
+  await db.execute('select 1 as ok')
   return { ok: true }
 }
 
-export async function statistics(db: DatabaseClient, dialect: DialectName) {
-  if (dialect === 'mysql' || dialect === 'mariadb') return (await sql`
+export async function statistics(db: DatabaseClient, _dialect: DialectName) {
+  return (await db.execute(`
     select table_schema as schema_name, count(*) as table_count,
       coalesce(sum(table_rows), 0) as estimated_rows,
       coalesce(sum(data_length + index_length), 0) as bytes
     from information_schema.tables where table_schema = database() group by table_schema
-  `.execute(db)).rows
-  if (dialect === 'postgres') return (await sql`
-    select current_schema() as schema_name, count(*) as table_count,
-      coalesce(sum(n_live_tup), 0) as estimated_rows
-    from pg_stat_user_tables
-  `.execute(db)).rows
-  return (await sql`select count(*) as table_count from sqlite_master where type = 'table' and name not like 'sqlite_%'`.execute(db)).rows
-}
-
-export async function query(db: DatabaseClient, statement: string) {
-  return sql.raw(statement).execute(db)
-}
-
-function quotedIdentifier(value: string, dialect: DialectName): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error(`Unsafe identifier: ${value}`)
-  const quote = dialect === 'postgres' ? '"' : '`'
-  return `${quote}${value}${quote}`
+  `)).rows
 }
 
 export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: SelectPlan, policy: Pick<Policy, 'maxRows'> & { fetchExtra?: boolean }) {
@@ -116,40 +156,27 @@ export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: 
   const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
   const limit = pageSize + (policy.fetchExtra ? 1 : 0)
   const compiled = compileSelectPlan({ ...plan, limit }, { maxRows: limit }, dialect)
-  return db.executeQuery(CompiledQuery.raw(compiled.sql, compiled.parameters))
+  return db.execute(compiled.sql, compiled.parameters)
 }
 
-export async function indexes(db: DatabaseClient, dialect: DialectName, table: string) {
+export async function explainPlan(db: DatabaseClient, plan: SelectPlan, policy: Pick<Policy, 'maxRows'> = {}) {
+  const compiled = compileSelectPlan(plan, policy, 'mysql')
+  return db.execute(`EXPLAIN ${compiled.sql}`, compiled.parameters)
+}
+
+export async function indexes(db: DatabaseClient, _dialect: DialectName, table: string) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) throw new Error(`Unsafe identifier: ${table}`)
-  if (dialect === 'mysql' || dialect === 'mariadb') return (await sql.raw(`show index from \`${table}\``).execute(db)).rows
-  if (dialect === 'postgres') return (await sql`select indexname, indexdef from pg_indexes where tablename = ${table}`.execute(db)).rows
-  return (await sql.raw(`pragma index_list('${table}')`).execute(db)).rows
+  return (await db.execute(`show index from \`${table}\``)).rows
 }
 
-export async function relationships(db: DatabaseClient, dialect: DialectName, table?: string) {
-  if (dialect === 'mysql' || dialect === 'mariadb') {
-    const result = await sql`
-      select table_name, column_name, referenced_table_name, referenced_column_name
-      from information_schema.key_column_usage
-      where table_schema = database() and referenced_table_name is not null
-    `.execute(db)
-    return (result.rows as Array<Record<string, unknown>>).filter((row) => !table || String(row.table_name) === table)
-  }
-  if (dialect === 'postgres') {
-    const result = await sql`
-      select tc.table_name, kcu.column_name, ccu.table_name as referenced_table_name, ccu.column_name as referenced_column_name
-      from information_schema.table_constraints tc
-      join information_schema.key_column_usage kcu on tc.constraint_name = kcu.constraint_name and tc.table_schema = kcu.table_schema
-      join information_schema.constraint_column_usage ccu on ccu.constraint_name = tc.constraint_name and ccu.table_schema = tc.table_schema
-      where tc.constraint_type = 'FOREIGN KEY'
-    `.execute(db)
-    return (result.rows as Array<Record<string, unknown>>).filter((row) => !table || String(row.table_name) === table)
-  }
-  const tables = await discover(db, table)
-  const output: Array<Record<string, unknown>> = []
-  for (const entry of tables) {
-    const rows = (await sql.raw(`pragma foreign_key_list('${entry.name}')`).execute(db)).rows
-    output.push(...(rows as Array<Record<string, unknown>>).map((row) => ({ table_name: entry.name, ...row })))
-  }
-  return output
+export async function relationships(db: DatabaseClient, _dialect: DialectName, table?: string) {
+  const { rows } = await db.execute(`
+    select table_name as table_name, column_name as column_name,
+      referenced_table_name as referenced_table_name, referenced_column_name as referenced_column_name
+    from information_schema.key_column_usage
+    where table_schema = database() and referenced_table_name is not null
+      and (? is null or table_name = ?)
+    order by table_name, column_name
+  `, [table ?? null, table ?? null])
+  return rows
 }

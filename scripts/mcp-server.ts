@@ -4,10 +4,11 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { defaultAuditPath, writeAudit } from './audit.js'
 import { loadConfig, resolveConnection, resolveProfile } from './config.js'
-import { maskRows, makeExplainStatement, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
+import { maskRows, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
-import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
+import { connect, discover, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
+import { executeMutation, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
 
 const configPath = process.env.DB_AGENT_CONFIG
 
@@ -19,8 +20,15 @@ function failure(error: unknown) {
   return { content: [{ type: 'text' as const, text: error instanceof Error ? error.message : String(error) }], isError: true }
 }
 
+function auditedRowCount(value: unknown): number | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Record<string, unknown>
+  for (const key of ['rowCount', 'affectedRows', 'estimatedRows']) if (typeof record[key] === 'number') return record[key]
+  return undefined
+}
+
 async function withProfile<T>(profileName: string, action: string, approvalToken: string | undefined, run: (input: {
-  dialect: 'postgres' | 'mysql' | 'mariadb' | 'sqlite'
+  dialect: 'mysql'
   db: ReturnType<typeof connect>
   maxRows?: number
   timeoutMs?: number
@@ -37,7 +45,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), resolved.profile.timeoutMs)
   try {
     const value = await run({ dialect, db, maxRows: resolved.profile.maxRows, timeoutMs: resolved.profile.timeoutMs, sensitiveColumns: resolved.profile.sensitiveColumns, allowSensitive: resolved.profile.allowSensitive, policy: resolved.profile })
-    await writeAudit({ action, profile: profileName, dialect, success: true }, resolved.profile.auditLog ?? defaultAuditPath())
+    await writeAudit({ action, profile: profileName, dialect, success: true, rowCount: auditedRowCount(value) }, resolved.profile.auditLog ?? defaultAuditPath())
     return value
   } catch (error) {
     await writeAudit({ action, profile: profileName, dialect, success: false, error: error instanceof Error ? error.message : String(error) }, resolved.profile.auditLog ?? defaultAuditPath())
@@ -48,7 +56,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.3.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.5.0' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
@@ -151,6 +159,25 @@ const planSchema = z.object({
   offset: z.number().int().nonnegative().optional(),
 })
 
+const mutationValueSchema = z.union([z.string(), z.number().finite(), z.boolean(), z.null()])
+const mutationRowSchema = z.record(z.string(), mutationValueSchema)
+const mutationPredicateSchema = z.object({
+  column: z.string(),
+  op: z.enum(['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in', 'not in', 'between', 'is null', 'is not null']),
+  value: z.unknown().optional(),
+})
+const mutationFilterSchema: z.ZodType<unknown> = z.lazy(() => z.union([
+  mutationPredicateSchema,
+  z.object({ and: z.array(mutationFilterSchema).min(1) }),
+  z.object({ or: z.array(mutationFilterSchema).min(1) }),
+]))
+const mutationWhereSchema = z.union([z.array(mutationPredicateSchema).min(1), mutationFilterSchema])
+const mutationPlanSchema = z.discriminatedUnion('operation', [
+  z.object({ operation: z.literal('insert'), table: z.string(), rows: z.array(mutationRowSchema).min(1) }),
+  z.object({ operation: z.literal('update'), table: z.string(), set: mutationRowSchema, where: mutationWhereSchema }),
+  z.object({ operation: z.literal('delete'), table: z.string(), where: mutationWhereSchema }),
+])
+
 server.registerTool('database_query_plan', {
   title: 'Run a safe database query plan',
   description: 'Execute a parameterized read-only SelectPlan. Results are masked by default.',
@@ -171,30 +198,53 @@ server.registerTool('database_query_plan', {
   } catch (error) { return failure(error) }
 })
 
-server.registerTool('database_explain', {
-  title: 'Explain a read-only query',
-  description: 'Return the database execution plan for one read-only query.',
-  inputSchema: { profile: z.string(), sql: z.string(), approvalToken: z.string().optional() },
-  annotations: { readOnlyHint: true },
-}, async ({ profile, sql: statement, approvalToken }) => {
+server.registerTool('database_mutation_plan', {
+  title: 'Preview or execute a safe mutation plan',
+  description: 'Preview a structured InsertPlan, UpdatePlan, or DeletePlan by default. Execution requires profile write permission and an approval token.',
+  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: false, destructiveHint: true },
+}, async ({ profile, plan, execute, approvalToken }) => {
   try {
-    return result(await withProfile(profile, 'explain', approvalToken, async ({ db, dialect, timeoutMs }) => {
-      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), timeoutMs)
+    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`, approvalToken, async ({ db, timeoutMs, policy }) => {
+      validateMutationExecution(policy, execute === true, approvalToken)
+      validateMutationSchema(plan as MutationPlan, await executeWithTimeout(discover(db), timeoutMs))
+      if (execute === true) {
+        const mutation = await executeWithTimeout(executeMutation(db, plan as MutationPlan, policy, approvalToken), timeoutMs)
+        return { mode: 'executed', ...mutation }
+      }
+      return { mode: 'preview', ...(await executeWithTimeout(previewMutation(db, plan as MutationPlan, policy), timeoutMs)) }
+    }))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_explain', {
+  title: 'Explain a query plan',
+  description: 'Return the MySQL execution plan for one validated SelectPlan.',
+  inputSchema: { profile: z.string(), plan: planSchema, approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, plan, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'explain', approvalToken, async ({ db, timeoutMs, policy }) => {
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanPolicy(plan as SelectPlan, policy)
+      const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)
       return { rows: queryResult.rows, rowCount: queryResult.rows.length }
     }))
   } catch (error) { return failure(error) }
 })
 
 server.registerTool('database_assess', {
-  title: 'Assess query cost',
-  description: 'Explain a read-only query and return a low, medium, or high risk assessment.',
-  inputSchema: { profile: z.string(), sql: z.string(), approvalToken: z.string().optional() },
+  title: 'Assess query plan cost',
+  description: 'Explain a validated SelectPlan and return a low, medium, or high risk assessment.',
+  inputSchema: { profile: z.string(), plan: planSchema, approvalToken: z.string().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, sql: statement, approvalToken }) => {
+}, async ({ profile, plan, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs, policy }) => {
-      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), timeoutMs)
-      return { assessment: assessExplain(dialect, queryResult.rows as Array<Record<string, unknown>>, policy.maxEstimatedRows), plan: queryResult.rows }
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanPolicy(plan as SelectPlan, policy)
+      const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)
+      return { assessment: assessExplain(dialect, queryResult.rows, policy.maxEstimatedRows), plan: queryResult.rows }
     }))
   } catch (error) { return failure(error) }
 })

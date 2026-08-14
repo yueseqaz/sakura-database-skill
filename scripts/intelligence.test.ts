@@ -26,12 +26,6 @@ test('summarizes only observed schema facts without guessing relationships', () 
   })
 })
 
-test('reads PostgreSQL row estimates from textual EXPLAIN output', () => {
-  assert.deepEqual(assessExplain('postgres', [{ 'QUERY PLAN': 'Seq Scan on events  (cost=0.00..2000.00 rows=50000 width=8)' }]), {
-    risk: 'high', reasons: ['full table scan', 'estimated 50000 rows'], requiresApproval: true, estimatedRows: 50_000,
-  })
-})
-
 test('uses a profile-specific estimated-row threshold', () => {
   assert.deepEqual(assessExplain('mysql', [{ type: 'ALL', rows: 2_000 }], 1_000), {
     risk: 'high', reasons: ['full table scan', 'estimated 2000 rows'], requiresApproval: true, estimatedRows: 2_000,

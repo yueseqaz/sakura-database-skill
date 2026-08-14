@@ -2,7 +2,7 @@
 
 A universal database skill and TypeScript CLI for AI agents.
 
-Connect to local and remote MySQL, MariaDB, PostgreSQL, and SQLite databases. Discover schemas, execute bounded parameterized query plans, inspect `EXPLAIN` plans, analyze indexes and foreign keys, and check health through one policy-governed interface.
+Connect AI agents to local and remote MySQL databases through a focused mysql2 runtime. Discover schemas, execute bounded Query Plans, and preview or transactionally execute policy-controlled Mutation Plans through one audited interface.
 
 ## How It Works
 
@@ -12,7 +12,7 @@ The AI agent interprets the user's request and builds a structured Query Plan fr
 flowchart TD
     U["User request"] --> A["AI Agent + Database Skill"]
     A --> D["Discover real schema"]
-    D --> P["Build minimal Query Plan"]
+    D --> P["Build Query or Mutation Plan"]
     P --> I{"Interface"}
     I --> CLI["TypeScript CLI"]
     I --> MCP["MCP server"]
@@ -20,16 +20,15 @@ flowchart TD
     MCP --> S
 
     S --> Q["Parameterized queries<br/>pagination + EXPLAIN"]
-    S --> G["Read-only policy<br/>limits + timeout + masking + audit"]
+    S --> W["Previewed mutations<br/>approval + transaction + rollback"]
+    S --> G["Policy enforcement<br/>limits + timeout + masking + audit"]
     S --> M["Schema + indexes<br/>foreign keys + statistics"]
 
-    Q --> C["Database connectors"]
+    Q --> C["mysql2 connector"]
+    W --> C
     G --> C
     M --> C
-    C --> MY["MySQL"]
-    C --> MA["MariaDB"]
-    C --> PG["PostgreSQL"]
-    C --> SQ["SQLite read-only"]
+    C --> MY["MySQL read or transactional write session"]
     C --> SSH["Local, remote, or SSH tunnel"]
 ```
 
@@ -46,7 +45,6 @@ npm run db-agent -- doctor
 Use a least-privilege database account. Credentials belong in an environment variable or secret manager, never in source control.
 
 ```bash
-export DB_DIALECT=mysql
 export DATABASE_URL='mysql://readonly:password@localhost:3306/app'
 
 npm run db-agent -- health
@@ -55,19 +53,17 @@ npm run db-agent -- discover --table orders
 npm run db-agent -- summary --table orders
 npm run db-agent -- indexes --table orders
 npm run db-agent -- relations --table orders
-npm run db-agent -- explain --sql 'select id from orders where customer_id = 42 limit 100'
 ```
 
-Raw SQL is read-only and must include a `LIMIT` unless it is an aggregate. Prefer a Query Plan for dynamic values.
-
-Assess a query before execution when it may scan a large table:
+Create a Query Plan before data access. The CLI intentionally does not accept raw SQL. Assess or explain the same plan before execution when it may scan a large table:
 
 ```bash
-npm run db-agent -- assess --sql 'select id from orders where customer_id = 42 limit 100'
-npm run db-agent -- query --check --sql 'select id from orders where customer_id = 42 limit 100'
+npm run db-agent -- assess --file plan.json
+npm run db-agent -- explain --file plan.json
+npm run db-agent -- plan --file plan.json
 ```
 
-`assess` runs `EXPLAIN` and labels cost risk. `query --check` blocks high-risk scans unless `--allow-scan` is supplied after review. Query Plan results include `page.hasMore` and `page.nextOffset` when another page is available.
+`assess` compiles the validated plan, runs `EXPLAIN`, and labels cost risk. Query Plan results include `page.hasMore` and `page.nextOffset` when another page is available.
 
 ## Query Plans
 
@@ -89,9 +85,29 @@ Then execute it:
 npm run db-agent -- plan --file plan.json
 ```
 
-The CLI validates identifiers and operators, verifies tables and columns against the observed schema, binds values through Kysely, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. `--include-sensitive` also requires `allowSensitive: true` in the selected profile.
+The CLI validates identifiers and operators, verifies tables and columns against the observed schema, binds values through mysql2, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. `--include-sensitive` also requires `allowSensitive: true` in the selected profile.
 
-Query Plans also support nested `and`/`or` filters, `is null`, `is not null`, `between`, `not in`, controlled inner and left joins, `count`/`sum`/`avg`/`min`/`max`, grouping, and `having`. Raw SQL is parsed into an AST and must remain a single read-only query.
+Query Plans also support nested `and`/`or` filters, `is null`, `is not null`, `between`, `not in`, controlled inner and left joins, `count`/`sum`/`avg`/`min`/`max`, grouping, and `having`. There is no arbitrary SQL execution path.
+
+## Mutation Plans
+
+Use one structured Mutation Plan for insert, update, or delete. Preview is the default and does not modify data:
+
+```json
+{
+  "operation": "update",
+  "table": "orders",
+  "set": { "status": "closed" },
+  "where": { "column": "tenant_id", "op": "=", "value": 42 }
+}
+```
+
+```bash
+npm run db-agent -- mutate --file mutation.json --profile writer
+npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024
+```
+
+The profile must set `allowWrites: true`. Every execution requires an approval token. Update and delete require non-empty filters, are limited by `maxAffectedRows`, and roll back if the actual affected row count exceeds that limit. Delete additionally requires `allowDelete: true`. Existing table, column, and required-filter policies apply to mutations.
 
 ## Example Agent Workflow
 
@@ -152,7 +168,9 @@ It creates `~/.config/sakura-database-skill/profiles.json`. A profile can refere
       "maxRows": 50,
       "timeoutMs": 5000,
       "requireApproval": true,
-      "allowRawSql": false,
+      "allowWrites": true,
+      "allowDelete": false,
+      "maxAffectedRows": 20,
       "allowSensitive": false,
       "allowedTables": ["orders", "customers"],
       "deniedColumns": {
@@ -179,11 +197,11 @@ npm run db-agent -- profile list
 npm run db-agent -- health --profile production --approve change-ticket-123
 ```
 
-Audit events are written as JSON Lines with duration and a one-way query fingerprint, without SQL parameter values. Production profiles require `--approve` by default. MySQL, MariaDB, and PostgreSQL sessions enable database-side read-only protection and query timeouts; SQLite files are opened read-only.
+Audit events are written as JSON Lines with duration, affected or returned row count, and a one-way statement fingerprint, without parameter values. Production profiles require `--approve` by default. Reads use database-side read-only sessions. Approved mutations run in a transaction and roll back on failure or limit violations.
 
 ## MCP Server
 
-The stdio MCP server exposes read-only tools for health, statistics, discovery, schema summaries, indexes, foreign-key relations, Query Plans, `EXPLAIN`, and cost assessment.
+The stdio MCP server exposes health, statistics, discovery, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, `EXPLAIN`, and cost assessment. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts InsertPlan, UpdatePlan, or DeletePlan. No tool accepts raw SQL.
 
 ```bash
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
@@ -200,4 +218,4 @@ npm run build
 npm pack --dry-run
 ```
 
-GitHub Actions runs the suite against real PostgreSQL, MySQL, and MariaDB services. Local integration tests are skipped unless `TEST_POSTGRES_URL`, `TEST_MYSQL_URL`, or `TEST_MARIADB_URL` is configured.
+GitHub Actions runs the suite against a real MySQL service. Local integration tests are skipped unless `TEST_MYSQL_URL` is configured.
