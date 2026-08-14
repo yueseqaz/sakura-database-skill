@@ -46,9 +46,9 @@ test('caches permission metadata for the life of a database connection', async (
 test('falls back to SHOW GRANTS when privilege metadata is unavailable', async () => {
   const db: DatabaseClient = {
     async execute(statement) {
-      if (statement.includes('current_user() as account')) return { rows: [{ account: 'agent@%', database_name: 'app' }] }
+      if (statement.includes('current_user() as account')) return { rows: [{ account: 'agent@%', database_name: 'app_test' }] }
       if (statement.includes('information_schema.user_privileges')) return { rows: [] }
-      return { rows: [{ grants: 'GRANT ALL PRIVILEGES ON `app`.* TO `agent`@`%`' }] }
+      return { rows: [{ grants: 'GRANT ALL PRIVILEGES ON `app\\_test`.* TO `agent`@`%`' }] }
     },
     async transaction(run) { return run({ execute: db.execute }) },
     async destroy() {},

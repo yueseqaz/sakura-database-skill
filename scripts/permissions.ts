@@ -39,7 +39,8 @@ export function hasPrivilege(report: PermissionReport, privilege: MySqlPrivilege
 
 function unquoteIdentifier(value: string): string {
   const trimmed = value.trim()
-  return trimmed.startsWith('`') && trimmed.endsWith('`') ? trimmed.slice(1, -1).replaceAll('``', '`') : trimmed
+  const unquoted = trimmed.startsWith('`') && trimmed.endsWith('`') ? trimmed.slice(1, -1).replaceAll('``', '`') : trimmed
+  return unquoted.replaceAll('\\_', '_').replaceAll('\\%', '%').replaceAll('\\\\', '\\')
 }
 
 function privilegesFromGrants(rows: Array<Record<string, unknown>>, database: string | null): PermissionReport['privileges'] {
