@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -144,4 +144,16 @@ test('rejects the removed raw SQL command', async () => {
     const payload = JSON.parse((error as Error & { stderr?: string }).stderr ?? '{}') as { error?: { code?: string; message?: string } }
     return payload.error?.code === 'INVALID_REQUEST' && payload.error.message === 'Unknown command: query'
   })
+})
+
+test('runs the CLI through an npm-style symbolic link', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-bin-link-'))
+  const link = join(directory, 'sakura-db.ts')
+  try {
+    await symlink(join(root, 'scripts', 'db-agent.ts'), link)
+    const { stdout } = await execFileAsync('npx', ['tsx', link, '--help'], { cwd: root })
+    assert.match(stdout, /Usage: db-agent/)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
 })

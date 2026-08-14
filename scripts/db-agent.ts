@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
+import { realpathSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { compileSelectPlan, maskRows, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { defaultAuditPath, fingerprintStatement, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
@@ -249,7 +251,12 @@ async function run(): Promise<void> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+function isMainModule(): boolean {
+  if (!process.argv[1]) return false
+  try { return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)) } catch { return false }
+}
+
+if (isMainModule()) {
   run().catch((error: unknown) => {
     console.error(JSON.stringify(errorPayload(error)))
     process.exitCode = 1
