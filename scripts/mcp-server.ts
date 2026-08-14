@@ -10,6 +10,8 @@ import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan,
 import { openTunnel } from './tunnel.js'
 import { executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
 import { errorPayload } from './errors.js'
+import { permissions } from './permissions.js'
+import { executeSchemaPlan, previewSchemaPlan, type SchemaPlan } from './schema-changes.js'
 
 const configPath = process.env.DB_AGENT_CONFIG
 
@@ -26,6 +28,12 @@ function auditedRowCount(value: unknown): number | undefined {
   const record = value as Record<string, unknown>
   for (const key of ['rowCount', 'affectedRows', 'estimatedRows']) if (typeof record[key] === 'number') return record[key]
   return undefined
+}
+
+function auditedFingerprint(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const fingerprint = (value as Record<string, unknown>).planFingerprint
+  return typeof fingerprint === 'string' ? fingerprint : undefined
 }
 
 async function withProfile<T>(profileName: string, action: string, approvalToken: string | undefined, run: (input: {
@@ -46,7 +54,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), resolved.profile.timeoutMs)
   try {
     const value = await run({ dialect, db, maxRows: resolved.profile.maxRows, timeoutMs: resolved.profile.timeoutMs, sensitiveColumns: resolved.profile.sensitiveColumns, allowSensitive: resolved.profile.allowSensitive, policy: resolved.profile })
-    await writeAudit({ action, profile: profileName, dialect, success: true, rowCount: auditedRowCount(value) }, resolved.profile.auditLog ?? defaultAuditPath())
+    await writeAudit({ action, profile: profileName, dialect, success: true, rowCount: auditedRowCount(value), fingerprint: auditedFingerprint(value) }, resolved.profile.auditLog ?? defaultAuditPath())
     return value
   } catch (error) {
     await writeAudit({ action, profile: profileName, dialect, success: false, error: JSON.stringify(errorPayload(error).error) }, resolved.profile.auditLog ?? defaultAuditPath())
@@ -57,7 +65,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.7.1' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.8.0' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
@@ -179,6 +187,67 @@ const mutationPlanSchema = z.discriminatedUnion('operation', [
   z.object({ operation: z.literal('update'), table: z.string(), set: mutationRowSchema, where: mutationWhereSchema, optimisticLock: optimisticLockSchema.optional() }),
   z.object({ operation: z.literal('delete'), table: z.string(), where: mutationWhereSchema, optimisticLock: optimisticLockSchema.optional() }),
 ])
+
+const columnTypeSchema = z.enum(['tinyint', 'smallint', 'mediumint', 'int', 'bigint', 'decimal', 'float', 'double', 'boolean', 'char', 'varchar', 'text', 'mediumtext', 'longtext', 'binary', 'varbinary', 'blob', 'mediumblob', 'longblob', 'date', 'time', 'datetime', 'timestamp', 'year', 'json', 'enum'])
+const columnDefinitionSchema = z.object({
+  name: z.string(), type: columnTypeSchema, length: z.number().int().positive().optional(), precision: z.number().int().positive().optional(),
+  scale: z.number().int().nonnegative().optional(), unsigned: z.boolean().optional(), nullable: z.boolean().optional(), autoIncrement: z.boolean().optional(),
+  default: mutationValueSchema.or(z.literal('CURRENT_TIMESTAMP')).optional(), onUpdateCurrentTimestamp: z.boolean().optional(),
+  enumValues: z.array(z.string()).min(1).optional(), comment: z.string().optional(),
+})
+const indexDefinitionSchema = z.object({ name: z.string(), columns: z.array(z.string()).min(1), unique: z.boolean().optional() })
+const foreignKeyDefinitionSchema = z.object({
+  name: z.string(), columns: z.array(z.string()).min(1), referencedTable: z.string(), referencedColumns: z.array(z.string()).min(1),
+  onDelete: z.enum(['RESTRICT', 'CASCADE', 'SET NULL', 'NO ACTION']).optional(), onUpdate: z.enum(['RESTRICT', 'CASCADE', 'SET NULL', 'NO ACTION']).optional(),
+})
+const alterChangeSchema = z.discriminatedUnion('action', [
+  z.object({ action: z.literal('addColumn'), column: columnDefinitionSchema, after: z.string().optional(), first: z.boolean().optional() }),
+  z.object({ action: z.literal('modifyColumn'), column: columnDefinitionSchema }),
+  z.object({ action: z.literal('renameColumn'), from: z.string(), to: z.string() }),
+  z.object({ action: z.literal('dropColumn'), column: z.string() }),
+  z.object({ action: z.literal('addIndex'), index: indexDefinitionSchema }),
+  z.object({ action: z.literal('dropIndex'), index: z.string() }),
+  z.object({ action: z.literal('addForeignKey'), foreignKey: foreignKeyDefinitionSchema }),
+  z.object({ action: z.literal('dropForeignKey'), foreignKey: z.string() }),
+])
+const schemaPlanSchema = z.discriminatedUnion('operation', [
+  z.object({ operation: z.literal('createDatabase'), database: z.string(), charset: z.string().optional(), collation: z.string().optional() }),
+  z.object({ operation: z.literal('dropDatabase'), database: z.string() }),
+  z.object({ operation: z.literal('createTable'), table: z.string(), columns: z.array(columnDefinitionSchema).min(1), primaryKey: z.array(z.string()).optional(), indexes: z.array(indexDefinitionSchema).optional(), foreignKeys: z.array(foreignKeyDefinitionSchema).optional(), engine: z.literal('InnoDB').optional() }),
+  z.object({ operation: z.literal('alterTable'), table: z.string(), changes: z.array(alterChangeSchema).min(1) }),
+  z.object({ operation: z.literal('renameTable'), table: z.string(), newTable: z.string() }),
+  z.object({ operation: z.literal('dropTable'), table: z.string() }),
+])
+
+server.registerTool('database_permissions', {
+  title: 'Inspect database permissions',
+  description: 'Report the connected MySQL account privileges and derived query, data-write, and schema-change capabilities.',
+  inputSchema: { profile: z.string(), approvalToken: z.string().optional() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, approvalToken }) => {
+  try {
+    return result(await withProfile(profile, 'permissions', approvalToken, ({ db, timeoutMs }) => executeWithTimeout(permissions(db), timeoutMs)))
+  } catch (error) { return failure(error) }
+})
+
+server.registerTool('database_schema_plan', {
+  title: 'Preview or execute a controlled schema change',
+  description: 'Preview a structured database/table DDL plan with permissions, dependencies, risk, recovery metadata, and state fingerprint. Execution requires exact approval confirmations.',
+  inputSchema: {
+    profile: z.string(), plan: schemaPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(),
+    confirmFingerprint: z.string().optional(), confirmSchemaState: z.string().optional(), destructiveConfirmation: z.string().optional(), backupReference: z.string().optional(),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true },
+}, async ({ profile, plan, execute, approvalToken, confirmFingerprint, confirmSchemaState, destructiveConfirmation, backupReference }) => {
+  try {
+    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:schema:${plan.operation}`, approvalToken, async ({ db, timeoutMs, policy }) => {
+      if (execute === true) return executeSchemaPlan(db, plan as SchemaPlan, policy, {
+        approvalToken, confirmFingerprint, confirmSchemaState, destructiveConfirmation, backupReference, profileName: profile,
+      })
+      return { mode: 'preview', ...(await executeWithTimeout(previewSchemaPlan(db, plan as SchemaPlan, policy, profile), timeoutMs)) }
+    }))
+  } catch (error) { return failure(error) }
+})
 
 server.registerTool('database_query_plan', {
   title: 'Run a safe database query plan',

@@ -1,11 +1,11 @@
 ---
 name: database-agent
-description: Use when Codex needs safe access to a local or remote MySQL database for schema discovery, constrained data lookup, controlled inserts or updates, approved deletes, EXPLAIN analysis, or database MCP operations.
+description: Use when Codex needs safe access to a local or remote MySQL database for schema discovery, constrained queries, controlled data writes, permission inspection, or approved database and table structure changes.
 ---
 
 # Database Agent
 
-Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language requests into a minimal `SelectPlan` or `MutationPlan`. The tool does not accept raw SQL.
+Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language requests into a minimal `SelectPlan`, `MutationPlan`, or `SchemaPlan`. The tool does not accept raw SQL.
 
 ## Workflow
 
@@ -18,6 +18,8 @@ Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language re
 For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Preserve its `planFingerprint`. Execute only after the user approves that exact preview, using `execute: true`, the supplied approval token, and `confirmFingerprint`. If the plan or policy changes, preview again. Never invent an approval token or fingerprint.
 
 For insert execution, supply a stable `idempotencyKey` derived from the user task and reuse it for every retry. Never change the key merely because a call timed out. For an update or delete that may race with another writer, include `optimisticLock` with an observed version or `updated_at` value and update the version in `set`. On `CONCURRENT_MODIFICATION`, read and preview again; never remove the lock to force the write.
+
+For a structure change, call `database_permissions`, then preview the structured plan with `database_schema_plan`. Report the generated SQL, risk, row/storage estimate, foreign-key dependencies, missing privileges, backup requirement, and recovery statements. Execute only after the user approves the exact `planFingerprint` and `confirmSchemaState`. Supply the returned `destructiveConfirmation` exactly for data-losing plans. When `backupRequired` is true, require a real `backupReference`; never invent a backup, approval, fingerprint, state fingerprint, or confirmation phrase. MySQL DDL auto-commits and cannot be promised transaction rollback.
 
 ```json
 {
@@ -36,6 +38,8 @@ npm run db-agent -- assess --file plan.json
 npm run db-agent -- explain --file plan.json
 npm run db-agent -- mutate --file mutation.json --profile writer
 npm run db-agent -- mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key <task-key>
+npm run db-agent -- permissions --profile admin
+npm run db-agent -- schema --file schema.json --profile admin
 ```
 
 ## Profiles And Security
@@ -47,10 +51,12 @@ npm run db-agent -- mutate --file mutation.json --profile writer --execute --app
 - Treat `allowedTables`, `allowedColumns`, `deniedColumns`, and `requiredFilters` as hard boundaries.
 - Use `--include-sensitive` only when the profile sets `allowSensitive: true` and the user explicitly authorizes disclosure.
 - Prefer separate least-privilege read-only and writer profiles. Keep `allowWrites` false unless writes are required; enable `allowDelete` separately and set a small `maxAffectedRows`.
+- Treat `allowSchemaChanges`, `allowCreateDatabase`, `allowDrop`, `allowedDatabases`, and `allowedTables` as independent hard boundaries. Existing project accounts are valid; never create another database account unless the user requests it.
+- Never execute DDL without first previewing the same plan. Preview again after any schema drift or policy change.
 - Do not expose passwords, salts, tokens, phone numbers, email addresses, resumes, medical data, or raw audit logs unless explicitly authorized.
 - SSH tunnels are configured per profile and are closed after the command.
 - Use only `mysql://` connection URLs. This version intentionally does not support other database engines.
 
 ## MCP
 
-Run `npm run mcp` for stdio integration. Call `database_query_plan` for reads and `database_mutation_plan` for previewed writes. Pass the returned `planFingerprint` as `confirmFingerprint` only after approval, plus `idempotencyKey` for inserts. MCP explain and assess tools require a SelectPlan. MCP and CLI use the same paginated/on-demand schema validation, optimistic locking, idempotency, profile policy, limits, structured error codes, approval, transactions, rollback, masking, and audit controls.
+Run `npm run mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.

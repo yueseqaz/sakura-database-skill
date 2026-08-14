@@ -26,3 +26,19 @@ test('rejects non-MySQL profiles', async () => {
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('accepts explicit schema-change policy controls', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-schema-policy-'))
+  const path = join(directory, 'profiles.json')
+  try {
+    await writeFile(path, JSON.stringify({ profiles: { admin: {
+      dialect: 'mysql', urlEnv: 'DATABASE_URL', allowSchemaChanges: true, allowDrop: false,
+      allowCreateDatabase: true, allowedDatabases: ['sandbox'], allowedTables: ['users'],
+    } } }))
+    const config = await loadConfig(path)
+    assert.equal(config.profiles.admin.allowSchemaChanges, true)
+    assert.deepEqual(config.profiles.admin.allowedDatabases, ['sandbox'])
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})

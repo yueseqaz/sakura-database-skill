@@ -42,6 +42,10 @@ const policyFields = {
   allowWrites: z.boolean().optional(),
   allowDelete: z.boolean().optional(),
   maxAffectedRows: z.number().int().min(1).max(10_000).optional(),
+  allowSchemaChanges: z.boolean().optional(),
+  allowDrop: z.boolean().optional(),
+  allowCreateDatabase: z.boolean().optional(),
+  allowedDatabases: z.array(z.string().min(1)).optional(),
 }
 
 const sshTunnelSchema = z.object({
@@ -99,6 +103,8 @@ export async function writeExampleConfig(path = defaultConfigPath()): Promise<vo
         timeoutMs: 5_000,
         requireApproval: true,
         allowWrites: false,
+        allowSchemaChanges: false,
+        allowDrop: false,
       },
     },
   }

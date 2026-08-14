@@ -10,6 +10,9 @@ test('maps safety failures to stable structured error codes', () => {
   assert.equal(errorPayload(new Error('Unknown table in observed schema: users')).error.code, 'TABLE_NOT_FOUND')
   assert.equal(errorPayload(new Error('The row changed since preview.')).error.code, 'CONCURRENT_MODIFICATION')
   assert.equal(errorPayload(new Error('Idempotency key was already used for a different mutation plan.')).error.code, 'IDEMPOTENCY_CONFLICT')
+  assert.equal(errorPayload(new Error('Schema changes require allowSchemaChanges: true in the selected profile.')).error.code, 'SCHEMA_CHANGE_NOT_ALLOWED')
+  assert.equal(errorPayload(new Error('The schema state changed since preview.')).error.code, 'SCHEMA_STATE_CHANGED')
+  assert.equal(errorPayload(new Error('Destructive schema execution requires a backup reference.')).error.code, 'BACKUP_CONFIRMATION_REQUIRED')
 })
 
 test('redacts low-level connection errors and credentials', () => {

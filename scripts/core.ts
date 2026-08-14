@@ -42,6 +42,10 @@ export interface Policy {
   allowWrites?: boolean
   allowDelete?: boolean
   maxAffectedRows?: number
+  allowSchemaChanges?: boolean
+  allowDrop?: boolean
+  allowCreateDatabase?: boolean
+  allowedDatabases?: string[]
 }
 
 export const INTERNAL_IDEMPOTENCY_TABLE = '__sakura_database_idempotency'

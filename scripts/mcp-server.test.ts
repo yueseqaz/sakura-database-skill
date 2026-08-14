@@ -27,6 +27,14 @@ test('MCP explain and assess accept plans instead of raw SQL', async () => {
     assert.ok(mutationSchema.properties?.confirmFingerprint)
     assert.ok(mutationSchema.properties?.idempotencyKey)
     assert.equal(mutation?.annotations?.destructiveHint, true)
+    const schema = tools.tools.find((tool) => tool.name === 'database_schema_plan')
+    const schemaInput = schema?.inputSchema as { properties?: Record<string, unknown> }
+    assert.ok(schemaInput.properties?.plan)
+    assert.ok(schemaInput.properties?.confirmSchemaState)
+    assert.ok(schemaInput.properties?.destructiveConfirmation)
+    assert.ok(schemaInput.properties?.backupReference)
+    assert.equal(schema?.annotations?.destructiveHint, true)
+    assert.ok(tools.tools.some((tool) => tool.name === 'database_permissions'))
   } finally {
     await client.close()
   }
@@ -53,8 +61,10 @@ test('MCP server exposes and runs database tools', { skip: !process.env.TEST_MYS
       'database_health',
       'database_indexes',
       'database_mutation_plan',
+      'database_permissions',
       'database_query_plan',
       'database_relations',
+      'database_schema_plan',
       'database_stats',
       'database_summary',
     ])

@@ -78,6 +78,37 @@ test('previews and transactionally executes insert, update, and delete plans', {
   }
 })
 
+test('reports permissions and executes preview-bound schema plans through the CLI', { skip: !process.env.TEST_MYSQL_URL }, async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-schema-cli-'))
+  const configPath = join(directory, 'profiles.json')
+  const planPath = join(directory, 'schema.json')
+  const table = `schema_cli_${process.pid}`
+  const setup = createPool(process.env.TEST_MYSQL_URL as string)
+  await writeFile(configPath, JSON.stringify({ profiles: { admin: {
+    dialect: 'mysql', urlEnv: 'TEST_MYSQL_URL', environment: 'development', allowSchemaChanges: true,
+    allowDrop: true, allowedTables: [table],
+  } } }))
+  const base = ['schema', '--file', planPath, '--profile', 'admin', '--config', configPath]
+  const run = async (plan: unknown, destructive?: string) => {
+    await writeFile(planPath, JSON.stringify(plan))
+    const preview = JSON.parse((await cli(base, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as { planFingerprint: string; schemaStateFingerprint: string }
+    const args = [...base, '--execute', '--approve', 'ci-ticket', '--confirm', preview.planFingerprint, '--confirm-state', preview.schemaStateFingerprint]
+    if (destructive) args.push('--confirm-destructive', destructive, '--backup-reference', 'ci-temporary-table')
+    return JSON.parse((await cli(args, { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as Record<string, unknown>
+  }
+  try {
+    const permissionReport = JSON.parse((await cli(['permissions', '--profile', 'admin', '--config', configPath], { TEST_MYSQL_URL: process.env.TEST_MYSQL_URL })).stdout) as { capabilities: { query: boolean } }
+    assert.equal(permissionReport.capabilities.query, true)
+    assert.equal((await run({ operation: 'createTable', table, columns: [{ name: 'id', type: 'int', nullable: false }], primaryKey: ['id'] })).mode, 'executed')
+    assert.equal((await run({ operation: 'alterTable', table, changes: [{ action: 'addColumn', column: { name: 'name', type: 'varchar', length: 100 } }] })).mode, 'executed')
+    assert.equal((await run({ operation: 'dropTable', table }, `DROP TABLE ${table}`)).mode, 'executed')
+  } finally {
+    await setup.query(`drop table if exists \`${table}\``)
+    await setup.end()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('creates a profile template through the CLI', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'database-agent-config-'))
   const configPath = join(directory, 'profiles.json')

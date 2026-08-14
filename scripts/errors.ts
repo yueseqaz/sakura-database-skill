@@ -15,6 +15,13 @@ export type DatabaseAgentErrorCode =
   | 'CONCURRENT_MODIFICATION'
   | 'IDEMPOTENCY_REQUIRED'
   | 'IDEMPOTENCY_CONFLICT'
+  | 'SCHEMA_CHANGE_NOT_ALLOWED'
+  | 'DROP_NOT_ALLOWED'
+  | 'DATABASE_CREATE_NOT_ALLOWED'
+  | 'PERMISSION_DENIED'
+  | 'SCHEMA_STATE_CHANGED'
+  | 'DESTRUCTIVE_CONFIRMATION_REQUIRED'
+  | 'BACKUP_CONFIRMATION_REQUIRED'
   | 'INVALID_REQUEST'
   | 'DATABASE_ERROR'
 
@@ -33,7 +40,14 @@ const messageMappings: Array<[RegExp, DatabaseAgentErrorCode]> = [
   [/preview fingerprint/i, 'PLAN_FINGERPRINT_MISMATCH'],
   [/requires an idempotency key/i, 'IDEMPOTENCY_REQUIRED'],
   [/Idempotency key was already used|previous idempotent mutation/i, 'IDEMPOTENCY_CONFLICT'],
+  [/schema state changed|matching schema state fingerprint/i, 'SCHEMA_STATE_CHANGED'],
   [/changed since preview/i, 'CONCURRENT_MODIFICATION'],
+  [/Schema changes require allowSchemaChanges/i, 'SCHEMA_CHANGE_NOT_ALLOWED'],
+  [/Drop operations require allowDrop/i, 'DROP_NOT_ALLOWED'],
+  [/Database creation requires allowCreateDatabase/i, 'DATABASE_CREATE_NOT_ALLOWED'],
+  [/missing MySQL privilege|does not have the required MySQL privilege/i, 'PERMISSION_DENIED'],
+  [/destructive confirmation/i, 'DESTRUCTIVE_CONFIRMATION_REQUIRED'],
+  [/requires a backup reference/i, 'BACKUP_CONFIRMATION_REQUIRED'],
   [/non-empty filter|plans require .*filter/i, 'FILTER_REQUIRED'],
   [/affected-row limit|exceeds the affected-row/i, 'AFFECTED_ROWS_EXCEEDED'],
   [/Unknown table/i, 'TABLE_NOT_FOUND'],

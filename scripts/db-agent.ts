@@ -9,8 +9,10 @@ import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from '
 import { doctor } from './doctor.js'
 import { compileMutationPlan, executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
 import { errorPayload } from './errors.js'
+import { permissions } from './permissions.js'
+import { compileSchemaPlan, executeSchemaPlan, previewSchemaPlan, type SchemaPlan } from './schema-changes.js'
 
-type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
+type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'schema' | 'permissions' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
 type OutputFormat = 'json' | 'table' | 'csv'
 
 interface Args {
@@ -40,7 +42,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   const help = command === '--help' || command === '-h' || values.help === true
-  if (command && !['discover', 'summary', 'assess', 'plan', 'mutate', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
+  if (command && !['discover', 'summary', 'assess', 'plan', 'mutate', 'schema', 'permissions', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
     throw new Error(`Unknown command: ${command}`)
   }
   return { command: command as Command | undefined, values, positionals, help }
@@ -58,8 +60,10 @@ Database commands:
   explain --file <plan.json>     Inspect a SelectPlan execution plan.
   assess --file <plan.json>      Explain and rate a SelectPlan's cost.
   mutate --file <plan.json>      Preview an Insert/Update/Delete MutationPlan.
+  schema --file <plan.json>      Preview a structured database or table schema change.
   indexes --table name            List table indexes.
   relations [--table name]       List foreign-key relationships.
+  permissions                    Report effective MySQL capabilities.
 
 Configuration:
   doctor [--profile name]        Check runtime and configuration readiness.
@@ -67,6 +71,7 @@ Configuration:
   profile list|show <name>        Inspect configured profiles.
 
 Mutation execution: mutate --file <plan.json> --profile name --execute --approve token --confirm fingerprint [--idempotency-key key]
+Schema execution: schema --file <plan.json> --profile name --execute --approve token --confirm fingerprint --confirm-state fingerprint [--confirm-destructive phrase --backup-reference id]
 Common options: --profile name --config path --approve token --format json|table|csv
 Environment: DATABASE_URL=mysql://user:password@host:3306/database`)
 }
@@ -157,6 +162,30 @@ async function run(): Promise<void> {
       if (!table) throw new Error('indexes requires --table.')
       result = await executeWithTimeout(indexes(db, dialect, table), profile.timeoutMs)
     } else if (args.command === 'relations') result = await executeWithTimeout(relationships(db, dialect, stringValue(args.values, 'table')), profile.timeoutMs)
+    else if (args.command === 'permissions') result = await executeWithTimeout(permissions(db), profile.timeoutMs)
+    else if (args.command === 'schema') {
+      const file = stringValue(args.values, 'file')
+      if (!file) throw new Error('schema requires --file <plan.json>.')
+      const plan = JSON.parse(await readFile(file, 'utf8')) as SchemaPlan
+      const execute = args.values.execute === true
+      const approvalToken = stringValue(args.values, 'approve')
+      const profileName = resolvedProfile?.name ?? 'environment'
+      const compiled = compileSchemaPlan(plan, profile)
+      fingerprint = fingerprintStatement(compiled.sql)
+      action = `${execute ? 'execute' : 'preview'}:schema:${plan.operation}:${compiled.target}`
+      if (execute) {
+        result = await executeSchemaPlan(db, plan, profile, {
+          approvalToken,
+          profileName,
+          confirmFingerprint: stringValue(args.values, 'confirm'),
+          confirmSchemaState: stringValue(args.values, 'confirm-state'),
+          destructiveConfirmation: stringValue(args.values, 'confirm-destructive'),
+          backupReference: stringValue(args.values, 'backup-reference'),
+        })
+      } else {
+        result = { mode: 'preview', ...(await executeWithTimeout(previewSchemaPlan(db, plan, profile, profileName), profile.timeoutMs)) }
+      }
+    }
     else if (args.command === 'mutate') {
       const file = stringValue(args.values, 'file')
       if (!file) throw new Error('mutate requires --file <plan.json>.')

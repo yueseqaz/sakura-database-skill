@@ -2,7 +2,7 @@
 
 A universal database skill and TypeScript CLI for AI agents.
 
-Connect AI agents to local and remote MySQL databases through a focused mysql2 runtime. Discover schemas, execute bounded Query Plans, and preview or transactionally execute policy-controlled Mutation Plans through one audited interface.
+Connect AI agents to local and remote MySQL databases through a focused mysql2 runtime. Discover schemas and account permissions, execute bounded Query Plans, preview or transactionally execute Mutation Plans, and apply approved Schema Plans through one audited interface.
 
 ## How It Works
 
@@ -12,7 +12,7 @@ The AI agent interprets the user's request and builds a structured Query Plan fr
 flowchart TD
     U["User request"] --> A["AI Agent + Database Skill"]
     A --> D["Discover real schema"]
-    D --> P["Build Query or Mutation Plan"]
+    D --> P["Build Query, Mutation, or Schema Plan"]
     P --> I{"Interface"}
     I --> CLI["TypeScript CLI"]
     I --> MCP["MCP server"]
@@ -23,11 +23,13 @@ flowchart TD
     S --> W["Previewed mutations<br/>approval + transaction + rollback"]
     S --> G["Policy enforcement<br/>limits + timeout + masking + audit"]
     S --> M["Schema + indexes<br/>foreign keys + statistics"]
+    S --> DDL["DDL preflight<br/>permissions + risk + recovery"]
 
     Q --> C["mysql2 connector"]
     W --> C
     G --> C
     M --> C
+    DDL --> C
     C --> MY["MySQL read or transactional write session"]
     C --> SSH["Local, remote, or SSH tunnel"]
 ```
@@ -53,6 +55,7 @@ npm run db-agent -- discover --table orders --limit 50
 npm run db-agent -- summary --table orders
 npm run db-agent -- indexes --table orders
 npm run db-agent -- relations --table orders
+npm run db-agent -- permissions
 ```
 
 Create a Query Plan before data access. The CLI intentionally does not accept raw SQL. Assess or explain the same plan before execution when it may scan a large table:
@@ -118,6 +121,54 @@ The idempotency record and business mutation commit in one transaction. On first
 
 `optimisticLock` is optional for update and delete. It adds an equality condition for a version or `updated_at` column. When the value changed after preview, execution rolls back with `CONCURRENT_MODIFICATION`. Read the current row and preview again instead of removing the lock. This adds no extra query; the guard is part of the mutation's existing `WHERE` clause.
 
+## Permissions And Schema Plans
+
+`permissions` reports the connected account, selected database, effective global/database/table privileges, and derived query, data-write, and DDL capabilities. It does not create accounts or change grants. An existing project account works as-is; MySQL remains the final permission boundary.
+
+Schema Plans provide controlled DDL without accepting raw SQL:
+
+- `createDatabase` and `dropDatabase`
+- `createTable` with typed columns, primary key, indexes, and foreign keys
+- `alterTable` with add/modify/rename/drop column, add/drop index, and add/drop foreign key changes
+- `renameTable` and `dropTable`
+
+Example `schema.json`:
+
+```json
+{
+  "operation": "alterTable",
+  "table": "users",
+  "changes": [
+    {
+      "action": "addColumn",
+      "column": { "name": "avatar_url", "type": "varchar", "length": 500, "nullable": true },
+      "after": "username"
+    },
+    {
+      "action": "addIndex",
+      "index": { "name": "idx_users_avatar_url", "columns": ["avatar_url"] }
+    }
+  ]
+}
+```
+
+Preview first:
+
+```bash
+npm run db-agent -- schema --file schema.json --profile admin
+```
+
+The preview checks the target and referenced objects, column/index/foreign-key conflicts, effective MySQL privileges, approximate rows and bytes from `information_schema`, and dependency metadata. It returns generated SQL, risk reasons, reverse statements when they are valid, `planFingerprint`, and `schemaStateFingerprint`. Metadata checks do not scan business rows and run only for permission or Schema Plan commands.
+
+Execute the unchanged plan against the unchanged observed schema:
+
+```bash
+npm run db-agent -- schema --file schema.json --profile admin --execute \
+  --approve TICKET-2048 --confirm <planFingerprint> --confirm-state <schemaStateFingerprint>
+```
+
+Data-losing plans additionally require the exact returned `--confirm-destructive` phrase and a real `--backup-reference`. MySQL DDL auto-commits, so the tool does not claim transactional rollback. Reverse SQL is recovery guidance, not a substitute for a verified backup; drop and potentially truncating modifications may be irreversible.
+
 ## Example Agent Workflow
 
 Suppose a user asks:
@@ -179,6 +230,10 @@ It creates `~/.config/sakura-database-skill/profiles.json`. A profile can refere
       "requireApproval": true,
       "allowWrites": true,
       "allowDelete": false,
+      "allowSchemaChanges": true,
+      "allowCreateDatabase": false,
+      "allowDrop": false,
+      "allowedDatabases": ["app"],
       "maxAffectedRows": 20,
       "allowSensitive": false,
       "allowedTables": ["orders", "customers"],
@@ -212,13 +267,13 @@ CLI failures and MCP tool failures share the same structured shape: `{"error":{"
 
 ## MCP Server
 
-The stdio MCP server exposes health, statistics, discovery, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, `EXPLAIN`, and cost assessment. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts InsertPlan, UpdatePlan, or DeletePlan. No tool accepts raw SQL.
+The stdio MCP server exposes health, statistics, discovery, permissions, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, Schema Plans, `EXPLAIN`, and cost assessment. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts data plans; `database_schema_plan` accepts controlled DDL plans. No tool accepts raw SQL.
 
 ```bash
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
 ```
 
-Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; `database_mutation_plan` previews by default and requires `confirmFingerprint` when `execute` is true. Pass `idempotencyKey` for inserts and optional retry-safe updates/deletes. Mutation plans may include `optimisticLock`. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect the real schema and turn a natural-language request into a constrained Query Plan before calling the server. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
+Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; mutation and schema tools preview by default. Schema execution requires both the exact plan and observed-state fingerprints, plus destructive and backup confirmation when requested. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect live metadata and build the smallest constrained plan. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
 
 ## Development
 

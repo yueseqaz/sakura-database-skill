@@ -14,6 +14,7 @@ export interface TransactionClient {
 
 export interface DatabaseClient extends TransactionClient {
   transaction<T>(run: (transaction: TransactionClient) => Promise<T>): Promise<T>
+  executeAdministrative?(statement: string, parameters?: unknown[]): Promise<DatabaseResult>
   ensureIdempotencyStore?(): Promise<void>
   destroy(): Promise<void>
 }
@@ -88,6 +89,19 @@ export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): 
         throw error
       } finally {
         if (transactionTimer) clearTimeout(transactionTimer)
+        connection.release()
+      }
+    },
+    async executeAdministrative(statement, parameters = []) {
+      const connection = await pool.getConnection()
+      let administrativeTimer: NodeJS.Timeout | undefined
+      try {
+        await connection.query(`SET SESSION transaction_read_only = OFF, SESSION max_execution_time = ${boundedTimeout}`)
+        administrativeTimer = setTimeout(() => connection.destroy(), boundedTimeout)
+        const [result] = await connection.query(statement, parameters as never[])
+        return databaseResult(result)
+      } finally {
+        if (administrativeTimer) clearTimeout(administrativeTimer)
         connection.release()
       }
     },
