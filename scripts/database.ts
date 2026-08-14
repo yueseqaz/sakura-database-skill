@@ -58,7 +58,9 @@ export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): 
       const connection = await pool.getConnection()
       try {
         await connection.query(`SET SESSION transaction_read_only = ON, SESSION max_execution_time = ${boundedTimeout}`)
-        const [result] = await connection.execute(statement, parameters as never[])
+        // mysql2 escapes every value client-side. This avoids MySQL 8.4 prepared-statement
+        // type inference failures for metadata queries and parameterized LIMIT clauses.
+        const [result] = await connection.query(statement, parameters as never[])
         return databaseResult(result)
       } finally {
         connection.release()
@@ -73,7 +75,7 @@ export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): 
         transactionTimer = setTimeout(() => connection.destroy(), boundedTimeout)
         const transaction: TransactionClient = {
           async execute(statement, parameters = []) {
-            const [result] = await connection.execute(statement, parameters as never[])
+            const [result] = await connection.query(statement, parameters as never[])
             return databaseResult(result)
           },
         }
