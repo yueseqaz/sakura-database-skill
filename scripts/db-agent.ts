@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
-import { compileSelectPlan, makeExplainStatement, maskRows, safeStatement, type SelectPlan, validatePolicy } from './core.js'
-import { defaultAuditPath, writeAudit } from './audit.js'
+import { compileSelectPlan, makeExplainStatement, maskRows, safeStatement, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateRawSqlAccess, validateSensitiveAccess } from './core.js'
+import { defaultAuditPath, fingerprintStatement, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
 import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
+import { doctor } from './doctor.js'
 
-type Command = 'discover' | 'summary' | 'assess' | 'query' | 'plan' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config'
+type Command = 'discover' | 'summary' | 'assess' | 'query' | 'plan' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
 type OutputFormat = 'json' | 'table' | 'csv'
 
 interface Args {
@@ -37,7 +38,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   const help = command === '--help' || command === '-h' || values.help === true
-  if (command && !['discover', 'summary', 'assess', 'query', 'plan', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', '--help', '-h'].includes(command)) {
+  if (command && !['discover', 'summary', 'assess', 'query', 'plan', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
     throw new Error(`Unknown command: ${command}`)
   }
   return { command: command as Command | undefined, values, positionals, help }
@@ -59,11 +60,12 @@ Read-only commands:
   relations [--table name]       List foreign-key relationships.
 
 Configuration:
+  doctor [--profile name]        Check runtime and configuration readiness.
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
 
 Common options: --profile name --config path --approve token --format json|table|csv
-Environment: DB_DIALECT=postgres|mysql|sqlite DATABASE_URL=<connection URL>`)
+Environment: DB_DIALECT=postgres|mysql|mariadb|sqlite DATABASE_URL=<connection URL>`)
 }
 
 function stringValue(values: Args['values'], name: string): string | undefined {
@@ -104,6 +106,8 @@ async function run(): Promise<void> {
   if (args.help || !args.command) return usage()
   const configPath = stringValue(args.values, 'config') ?? defaultConfigPath()
 
+  if (args.command === 'doctor') return output(await doctor(configPath, stringValue(args.values, 'profile')))
+
   if (args.command === 'config') {
     if (args.positionals[0] === 'init') {
       await writeExampleConfig(configPath)
@@ -131,11 +135,13 @@ async function run(): Promise<void> {
   validatePolicy(profile, { action: args.command, approvalToken: stringValue(args.values, 'approve') })
 
   const tunnel = profile.sshTunnel ? await openTunnel(profile.sshTunnel) : undefined
-  const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort))
+  const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), profile.timeoutMs)
   const format = (stringValue(args.values, 'format') ?? 'json') as OutputFormat
   const auditPath = profile.auditLog ?? stringValue(args.values, 'audit-log') ?? defaultAuditPath()
   let action: string = args.command
   let rowCount: number | undefined
+  let fingerprint: string | undefined
+  const startedAt = Date.now()
   try {
     let result: unknown
     if (args.command === 'health') result = { ...(await executeWithTimeout(health(db), profile.timeoutMs)), dialect }
@@ -148,7 +154,7 @@ async function run(): Promise<void> {
       const source = stringValue(args.values, 'sql')
       if (!source) throw new Error('assess requires --sql.')
       const plan = await executeWithTimeout(query(db, makeExplainStatement(dialect, source)), profile.timeoutMs)
-      result = { assessment: assessExplain(dialect, plan.rows as Array<Record<string, unknown>>), plan: plan.rows }
+      result = { assessment: assessExplain(dialect, plan.rows as Array<Record<string, unknown>>, profile.maxEstimatedRows), plan: plan.rows }
     }
     else if (args.command === 'indexes') {
       const table = stringValue(args.values, 'table')
@@ -157,12 +163,15 @@ async function run(): Promise<void> {
     } else if (args.command === 'relations') result = await executeWithTimeout(relationships(db, dialect, stringValue(args.values, 'table')), profile.timeoutMs)
     else {
       let statement: string
-      let parameters: unknown[] = []
       if (args.command === 'plan') {
         const file = stringValue(args.values, 'file')
         if (!file) throw new Error('plan requires --file <plan.json>.')
         const plan = JSON.parse(await readFile(file, 'utf8')) as SelectPlan
-        compileSelectPlan(plan, profile, dialect)
+        const compiledPlan = compileSelectPlan(plan, profile, dialect)
+        validatePlanSchema(plan, await executeWithTimeout(discover(db), profile.timeoutMs))
+        validatePlanPolicy(plan, profile)
+        validateSensitiveAccess(profile, args.values['include-sensitive'] === true)
+        fingerprint = fingerprintStatement(compiledPlan.sql)
         action = `plan:${plan.table}`
         const pageSize = Math.max(1, Math.min(plan.limit ?? profile.maxRows ?? 100, profile.maxRows ?? 100))
         const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize }, { ...profile, fetchExtra: true }), profile.timeoutMs)
@@ -171,17 +180,21 @@ async function run(): Promise<void> {
         rowCount = pageRows.length
         const rows = args.values['include-sensitive'] === true ? pageRows : maskRows(pageRows as Array<Record<string, unknown>>, profile.sensitiveColumns)
         result = { rows, rowCount, page: pagination }
-        await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount }, auditPath)
+        await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
         output(result, format)
         return
       } else {
         const source = stringValue(args.values, 'sql')
         if (!source) throw new Error(`${args.command} requires --sql.`)
-        statement = safeStatement(source)
-        if (args.command === 'query') assertRawQueryIsBounded(statement)
+        statement = safeStatement(source, dialect)
+        if (args.command === 'query') {
+          validateRawSqlAccess(profile)
+          assertRawQueryIsBounded(statement)
+        }
+        fingerprint = fingerprintStatement(statement)
         if (args.command === 'query' && args.values.check === true) {
           const explainResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), profile.timeoutMs)
-          const assessment = assessExplain(dialect, explainResult.rows as Array<Record<string, unknown>>)
+          const assessment = assessExplain(dialect, explainResult.rows as Array<Record<string, unknown>>, profile.maxEstimatedRows)
           if (assessment.requiresApproval && args.values['allow-scan'] !== true) {
             throw new Error(`Query blocked: ${assessment.reasons.join(', ')}. Re-run with --allow-scan after review.`)
           }
@@ -190,13 +203,14 @@ async function run(): Promise<void> {
       }
       const queryResult = await executeWithTimeout(query(db, statement), profile.timeoutMs)
       rowCount = queryResult.rows.length
+      validateSensitiveAccess(profile, args.values['include-sensitive'] === true)
       const rows = args.values['include-sensitive'] === true ? queryResult.rows : maskRows(queryResult.rows as Array<Record<string, unknown>>, profile.sensitiveColumns)
       result = { rows, rowCount }
     }
-    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount }, auditPath)
+    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
     output(result, format)
   } catch (error) {
-    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, error: error instanceof Error ? error.message : String(error) }, auditPath)
+    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, error: error instanceof Error ? error.message : String(error), fingerprint, durationMs: Date.now() - startedAt }, auditPath)
     throw error
   } finally {
     await db.destroy()

@@ -1,9 +1,9 @@
 import Database from 'better-sqlite3'
-import { Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely'
+import { CompiledQuery, Kysely, MysqlDialect, PostgresDialect, SqliteDialect, sql } from 'kysely'
 import { createPool } from 'mysql2'
 import { Pool } from 'pg'
 import type { DialectName } from './core.js'
-import type { Policy, SelectPlan } from './core.js'
+import { compileSelectPlan, type Policy, type SelectPlan } from './core.js'
 
 export type DatabaseClient = Kysely<Record<string, never>>
 
@@ -11,19 +11,27 @@ function sqlitePath(url: string): string {
   return url.startsWith('sqlite://') ? decodeURIComponent(url.slice('sqlite://'.length)) : url
 }
 
-function mysqlPoolFromUrl(url: string) {
+function mysqlPoolFromUrl(url: string, timeoutMs: number, dialect: 'mysql' | 'mariadb') {
   const parsed = new URL(url)
-  if (parsed.protocol !== 'mysql:') throw new Error('MySQL DATABASE_URL must start with mysql://.')
+  if (!['mysql:', 'mariadb:'].includes(parsed.protocol)) throw new Error('MySQL and MariaDB DATABASE_URL must start with mysql:// or mariadb://.')
   const requestedTimezone = parsed.searchParams.get('timezone') ?? parsed.searchParams.get('serverTimezone')
   const timezone = requestedTimezone && /^(Z|local|[+-]\d{2}:?\d{2})$/.test(requestedTimezone) ? requestedTimezone : undefined
-  return createPool({
+  const pool = createPool({
     host: parsed.hostname,
     port: Number(parsed.port || '3306'),
     user: decodeURIComponent(parsed.username),
     password: decodeURIComponent(parsed.password),
     database: decodeURIComponent(parsed.pathname.slice(1)),
     timezone,
+    multipleStatements: false,
   })
+  pool.on('connection', (connection) => {
+    const statement = dialect === 'mariadb'
+      ? `SET SESSION tx_read_only = ON, SESSION max_statement_time = ${timeoutMs / 1_000}`
+      : `SET SESSION transaction_read_only = ON, SESSION max_execution_time = ${timeoutMs}`
+    connection.query(statement, (error) => { if (error) connection.destroy() })
+  })
+  return pool
 }
 
 export function withLocalTunnel(url: string, localPort?: number): string {
@@ -34,9 +42,12 @@ export function withLocalTunnel(url: string, localPort?: number): string {
   return parsed.toString()
 }
 
-export function connect(dialect: DialectName, url: string): DatabaseClient {
-  if (dialect === 'postgres') return new Kysely({ dialect: new PostgresDialect({ pool: new Pool({ connectionString: url }) }) })
-  if (dialect === 'mysql') return new Kysely({ dialect: new MysqlDialect({ pool: mysqlPoolFromUrl(url) }) })
+export function connect(dialect: DialectName, url: string, timeoutMs = 10_000): DatabaseClient {
+  const boundedTimeout = Math.max(100, Math.min(timeoutMs, 120_000))
+  if (dialect === 'postgres') return new Kysely({ dialect: new PostgresDialect({
+    pool: new Pool({ connectionString: url, options: `-c default_transaction_read_only=on -c statement_timeout=${boundedTimeout}` }),
+  }) })
+  if (dialect === 'mysql' || dialect === 'mariadb') return new Kysely({ dialect: new MysqlDialect({ pool: mysqlPoolFromUrl(url, boundedTimeout, dialect) }) })
   return new Kysely({ dialect: new SqliteDialect({ database: new Database(sqlitePath(url), { readonly: true }) }) })
 }
 
@@ -76,7 +87,7 @@ export async function health(db: DatabaseClient): Promise<{ ok: true }> {
 }
 
 export async function statistics(db: DatabaseClient, dialect: DialectName) {
-  if (dialect === 'mysql') return (await sql`
+  if (dialect === 'mysql' || dialect === 'mariadb') return (await sql`
     select table_schema as schema_name, count(*) as table_count,
       coalesce(sum(table_rows), 0) as estimated_rows,
       coalesce(sum(data_length + index_length), 0) as bytes
@@ -101,41 +112,22 @@ function quotedIdentifier(value: string, dialect: DialectName): string {
 }
 
 export async function queryPlan(db: DatabaseClient, dialect: DialectName, plan: SelectPlan, policy: Pick<Policy, 'maxRows'> & { fetchExtra?: boolean }) {
-  if (plan.columns.length === 0) throw new Error('Select plans require at least one column.')
   const maxRows = Math.max(1, Math.min(policy.maxRows ?? 100, 10_000))
   const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows, maxRows))
   const limit = pageSize + (policy.fetchExtra ? 1 : 0)
-  const offset = Math.max(0, plan.offset ?? 0)
-  const columns = sql.join(plan.columns.map((column) => sql.raw(quotedIdentifier(column, dialect))), sql.raw(', '))
-  const predicates = (plan.where ?? []).map(({ column, op, value }) => {
-    const normalized = op.toLowerCase()
-    if (!['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in'].includes(normalized)) throw new Error(`Unsupported operator: ${op}`)
-    const identifier = sql.raw(quotedIdentifier(column, dialect))
-    if (normalized === 'in') {
-      if (!Array.isArray(value) || value.length === 0) throw new Error('IN requires a non-empty array.')
-      return sql`${identifier} in (${sql.join(value.map((item) => sql.val(item)), sql.raw(', '))})`
-    }
-    return sql`${identifier} ${sql.raw(normalized.toUpperCase())} ${sql.val(value)}`
-  })
-  const orderBy = (plan.orderBy ?? []).map(({ column, direction = 'asc' }) => {
-    if (!['asc', 'desc'].includes(direction)) throw new Error(`Unsupported sort direction: ${direction}`)
-    return sql`${sql.raw(quotedIdentifier(column, dialect))} ${sql.raw(direction.toUpperCase())}`
-  })
-  const where = predicates.length ? sql` where ${sql.join(predicates, sql.raw(' and '))}` : sql``
-  const ordering = orderBy.length ? sql` order by ${sql.join(orderBy, sql.raw(', '))}` : sql``
-  const pagination = offset > 0 ? sql` limit ${sql.val(limit)} offset ${sql.val(offset)}` : sql` limit ${sql.val(limit)}`
-  return sql`select ${columns} from ${sql.raw(quotedIdentifier(plan.table, dialect))}${where}${ordering}${pagination}`.execute(db)
+  const compiled = compileSelectPlan({ ...plan, limit }, { maxRows: limit }, dialect)
+  return db.executeQuery(CompiledQuery.raw(compiled.sql, compiled.parameters))
 }
 
 export async function indexes(db: DatabaseClient, dialect: DialectName, table: string) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(table)) throw new Error(`Unsafe identifier: ${table}`)
-  if (dialect === 'mysql') return (await sql.raw(`show index from \`${table}\``).execute(db)).rows
+  if (dialect === 'mysql' || dialect === 'mariadb') return (await sql.raw(`show index from \`${table}\``).execute(db)).rows
   if (dialect === 'postgres') return (await sql`select indexname, indexdef from pg_indexes where tablename = ${table}`.execute(db)).rows
   return (await sql.raw(`pragma index_list('${table}')`).execute(db)).rows
 }
 
 export async function relationships(db: DatabaseClient, dialect: DialectName, table?: string) {
-  if (dialect === 'mysql') {
+  if (dialect === 'mysql' || dialect === 'mariadb') {
     const result = await sql`
       select table_name, column_name, referenced_table_name, referenced_column_name
       from information_schema.key_column_usage

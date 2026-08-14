@@ -8,8 +8,8 @@ test('permits a single SELECT statement', () => {
 
 test('rejects multiple and modifying statements', () => {
   assert.throws(() => ensureReadOnlyStatement('select 1; delete from users'), /one SQL statement/)
-  assert.throws(() => ensureReadOnlyStatement('update users set admin = true'), /Only SELECT/)
-  assert.throws(() => ensureReadOnlyStatement('with deleted as (delete from users returning id) select * from deleted'), /not allowed/)
+  assert.throws(() => ensureReadOnlyStatement('update users set admin = true'), /read-only/)
+  assert.throws(() => ensureReadOnlyStatement('with deleted as (delete from users returning id) select * from deleted'), /read-only SQL|read-only/)
 })
 
 test('selects a dialect-appropriate EXPLAIN form', () => {

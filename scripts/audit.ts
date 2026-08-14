@@ -1,4 +1,5 @@
 import { appendFile, mkdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -10,6 +11,13 @@ export interface AuditEvent {
   rowCount?: number
   statement?: string
   error?: string
+  fingerprint?: string
+  durationMs?: number
+}
+
+export function fingerprintStatement(statement: string): string {
+  const normalized = statement.trim().replace(/\s+/g, ' ').toLowerCase()
+  return createHash('sha256').update(normalized).digest('hex').slice(0, 16)
 }
 
 export function defaultAuditPath(): string {

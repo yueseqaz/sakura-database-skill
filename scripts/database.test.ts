@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import Database from 'better-sqlite3'
-import { writeAudit } from './audit.js'
-import { connect, discover, queryPlan, statistics } from './database.js'
+import { fingerprintStatement, writeAudit } from './audit.js'
+import { connect, discover, query, queryPlan, statistics } from './database.js'
 import { maskRows } from './core.js'
 
 test('executes a parameterized plan and masks the returned email', async () => {
@@ -25,6 +25,7 @@ test('executes a parameterized plan and masks the returned email', async () => {
       table: 'users', columns: ['id', 'email'], where: [{ column: 'status', op: '=', value: 'active' }],
     }, { maxRows: 5 })
     assert.deepEqual(maskRows(result.rows as Array<Record<string, unknown>>), [{ id: 1, email: '[REDACTED]' }])
+    await assert.rejects(() => query(db, "update users set status = 'disabled'"), /readonly/i)
   } finally {
     await db.destroy()
     await rm(directory, { recursive: true, force: true })
@@ -43,4 +44,12 @@ test('writes audit events without query values', async () => {
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
+})
+
+test('creates a stable query fingerprint without retaining SQL text', () => {
+  const first = fingerprintStatement('select id from users where status = ?')
+  const second = fingerprintStatement('  select  id  from users where status = ?  ')
+  assert.equal(first, second)
+  assert.equal(first.length, 16)
+  assert.ok(!first.includes('users'))
 })

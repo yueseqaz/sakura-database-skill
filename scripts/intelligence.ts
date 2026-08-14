@@ -34,16 +34,16 @@ export function paginatePlan(plan: SelectPlan, fetchedCount: number) {
   return { returned: Math.min(fetchedCount, limit), hasMore: fetchedCount > limit, nextOffset: fetchedCount > limit ? offset + limit : undefined }
 }
 
-export function assessExplain(dialect: DialectName, rows: Array<Record<string, unknown>>) {
+export function assessExplain(dialect: DialectName, rows: Array<Record<string, unknown>>, maxEstimatedRows = 10_000) {
   const text = rows.map((row) => Object.values(row).join(' ')).join(' ').toLowerCase()
-  const fullScan = dialect === 'mysql' ? rows.some((row) => String(row.type).toUpperCase() === 'ALL') : dialect === 'postgres' ? text.includes('seq scan') : text.includes('scan') && !text.includes('using index')
+  const fullScan = dialect === 'mysql' || dialect === 'mariadb' ? rows.some((row) => String(row.type).toUpperCase() === 'ALL') : dialect === 'postgres' ? text.includes('seq scan') : text.includes('scan') && !text.includes('using index')
   const structuredEstimates = rows.map((row) => Number(row.rows ?? 0)).filter(Number.isFinite)
   const textEstimates = dialect === 'postgres' ? [...text.matchAll(/rows=(\d+)/g)].map((match) => Number(match[1])) : []
   const estimate = Math.max(0, ...structuredEstimates, ...textEstimates)
   const reasons = [
     ...(fullScan ? ['full table scan'] : []),
-    ...(estimate >= 10_000 ? [`estimated ${estimate} rows`] : []),
+    ...(estimate >= maxEstimatedRows ? [`estimated ${estimate} rows`] : []),
   ]
-  const risk = fullScan && estimate >= 10_000 ? 'high' : fullScan || estimate >= 1_000 ? 'medium' : 'low'
-  return { risk, reasons, requiresApproval: risk === 'high' }
+  const risk = fullScan && estimate >= maxEstimatedRows ? 'high' : fullScan || estimate >= Math.min(1_000, maxEstimatedRows) ? 'medium' : 'low'
+  return { risk, reasons, requiresApproval: risk === 'high', estimatedRows: estimate }
 }

@@ -1,18 +1,40 @@
 {
-  "name": "database-agent-skill",
-  "private": true,
+  "name": "sakura-database-skill",
+  "version": "0.3.0",
+  "description": "A universal database skill and TypeScript CLI for AI agents.",
+  "private": false,
   "type": "module",
+  "bin": {
+    "sakura-db": "dist/db-agent.js",
+    "sakura-db-mcp": "dist/mcp-server.js"
+  },
+  "files": [
+    "dist",
+    "agents",
+    "README.md",
+    "SKILL.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yueseqaz/sakura-database-skill.git"
+  },
   "scripts": {
     "db-agent": "tsx scripts/db-agent.ts",
     "mcp": "tsx scripts/mcp-server.ts",
     "test": "tsx --test scripts/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^12.4.1",
     "kysely": "^0.28.8",
     "mysql2": "^3.15.1",
+    "node-sql-parser": "^5.3.8",
     "pg": "^8.16.3",
     "zod": "^4.4.3"
   },

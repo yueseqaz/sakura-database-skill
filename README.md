@@ -2,7 +2,7 @@
 
 A universal database skill and TypeScript CLI for AI agents.
 
-Connect to local and remote MySQL, PostgreSQL, and SQLite databases. Discover schemas, execute bounded parameterized query plans, inspect `EXPLAIN` plans, analyze indexes and foreign keys, and check health through one policy-governed interface.
+Connect to local and remote MySQL, MariaDB, PostgreSQL, and SQLite databases. Discover schemas, execute bounded parameterized query plans, inspect `EXPLAIN` plans, analyze indexes and foreign keys, and check health through one policy-governed interface.
 
 ## How It Works
 
@@ -27,6 +27,7 @@ flowchart TD
     G --> C
     M --> C
     C --> MY["MySQL"]
+    C --> MA["MariaDB"]
     C --> PG["PostgreSQL"]
     C --> SQ["SQLite read-only"]
     C --> SSH["Local, remote, or SSH tunnel"]
@@ -37,6 +38,7 @@ flowchart TD
 ```bash
 npm install
 npm run db-agent -- --help
+npm run db-agent -- doctor
 ```
 
 ## Quick start
@@ -87,7 +89,9 @@ Then execute it:
 npm run db-agent -- plan --file plan.json
 ```
 
-The CLI validates identifiers and operators, binds values through Kysely, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. Use `--include-sensitive` only with explicit authorization.
+The CLI validates identifiers and operators, verifies tables and columns against the observed schema, binds values through Kysely, caps the result size, and masks sensitive fields such as passwords, tokens, emails, phones, resumes, and medical data. `--include-sensitive` also requires `allowSensitive: true` in the selected profile.
+
+Query Plans also support nested `and`/`or` filters, `is null`, `is not null`, `between`, `not in`, controlled inner and left joins, `count`/`sum`/`avg`/`min`/`max`, grouping, and `having`. Raw SQL is parsed into an AST and must remain a single read-only query.
 
 ## Example Agent Workflow
 
@@ -148,6 +152,16 @@ It creates `~/.config/sakura-database-skill/profiles.json`. A profile can refere
       "maxRows": 50,
       "timeoutMs": 5000,
       "requireApproval": true,
+      "allowRawSql": false,
+      "allowSensitive": false,
+      "allowedTables": ["orders", "customers"],
+      "deniedColumns": {
+        "customers": ["password_hash", "access_token"]
+      },
+      "requiredFilters": {
+        "orders": ["tenant_id"]
+      },
+      "maxEstimatedRows": 10000,
       "sshTunnel": {
         "host": "bastion.example.com",
         "user": "readonly",
@@ -165,7 +179,7 @@ npm run db-agent -- profile list
 npm run db-agent -- health --profile production --approve change-ticket-123
 ```
 
-Audit events are written as JSON Lines, without query parameter values. Production profiles require `--approve` by default.
+Audit events are written as JSON Lines with duration and a one-way query fingerprint, without SQL parameter values. Production profiles require `--approve` by default. MySQL, MariaDB, and PostgreSQL sessions enable database-side read-only protection and query timeouts; SQLite files are opened read-only.
 
 ## MCP Server
 
@@ -182,4 +196,8 @@ Use the same profiles and policy controls as the CLI. The accompanying [`SKILL.m
 ```bash
 npm test
 npm run typecheck
+npm run build
+npm pack --dry-run
 ```
+
+GitHub Actions runs the suite against real PostgreSQL, MySQL, and MariaDB services. Local integration tests are skipped unless `TEST_POSTGRES_URL`, `TEST_MYSQL_URL`, or `TEST_MARIADB_URL` is configured.

@@ -4,7 +4,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { defaultAuditPath, writeAudit } from './audit.js'
 import { loadConfig, resolveConnection, resolveProfile } from './config.js'
-import { maskRows, makeExplainStatement, safeStatement, type SelectPlan, validatePolicy } from './core.js'
+import { maskRows, makeExplainStatement, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 import { connect, discover, executeWithTimeout, health, indexes, query, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
@@ -20,11 +20,13 @@ function failure(error: unknown) {
 }
 
 async function withProfile<T>(profileName: string, action: string, approvalToken: string | undefined, run: (input: {
-  dialect: 'postgres' | 'mysql' | 'sqlite'
+  dialect: 'postgres' | 'mysql' | 'mariadb' | 'sqlite'
   db: ReturnType<typeof connect>
   maxRows?: number
   timeoutMs?: number
   sensitiveColumns?: string[]
+  allowSensitive?: boolean
+  policy: Policy
 }) => Promise<T>): Promise<T> {
   const config = await loadConfig(configPath)
   const resolved = resolveProfile(config, profileName)
@@ -32,9 +34,9 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   validatePolicy(resolved.profile, { action, approvalToken })
   const { dialect, url } = resolveConnection(resolved.profile)
   const tunnel = resolved.profile.sshTunnel ? await openTunnel(resolved.profile.sshTunnel) : undefined
-  const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort))
+  const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), resolved.profile.timeoutMs)
   try {
-    const value = await run({ dialect, db, maxRows: resolved.profile.maxRows, timeoutMs: resolved.profile.timeoutMs, sensitiveColumns: resolved.profile.sensitiveColumns })
+    const value = await run({ dialect, db, maxRows: resolved.profile.maxRows, timeoutMs: resolved.profile.timeoutMs, sensitiveColumns: resolved.profile.sensitiveColumns, allowSensitive: resolved.profile.allowSensitive, policy: resolved.profile })
     await writeAudit({ action, profile: profileName, dialect, success: true }, resolved.profile.auditLog ?? defaultAuditPath())
     return value
   } catch (error) {
@@ -46,7 +48,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.2.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.3.0' })
 
 server.registerTool('database_health', {
   title: 'Database health check',
@@ -120,10 +122,30 @@ server.registerTool('database_summary', {
   } catch (error) { return failure(error) }
 })
 
+const aggregateSchema = z.enum(['count', 'sum', 'avg', 'min', 'max'])
+const fieldSchema = z.union([z.string(), z.object({ aggregate: aggregateSchema, column: z.string().optional() })])
+const predicateSchema = z.object({
+  column: fieldSchema,
+  op: z.enum(['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in', 'not in', 'between', 'is null', 'is not null']),
+  value: z.unknown().optional(),
+})
+const filterSchema: z.ZodType<unknown> = z.lazy(() => z.union([
+  predicateSchema,
+  z.object({ and: z.array(filterSchema).min(1) }),
+  z.object({ or: z.array(filterSchema).min(1) }),
+]))
+
 const planSchema = z.object({
   table: z.string(),
-  columns: z.array(z.string()).min(1),
-  where: z.array(z.object({ column: z.string(), op: z.enum(['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in']), value: z.unknown() })).optional(),
+  as: z.string().optional(),
+  columns: z.array(z.union([z.string(), z.object({ column: z.string().optional(), aggregate: aggregateSchema.optional(), as: z.string().optional() })])).min(1),
+  joins: z.array(z.object({
+    table: z.string(), as: z.string().optional(), type: z.enum(['inner', 'left']).optional(),
+    on: z.array(z.object({ left: z.string(), op: z.enum(['=', '!=', '<>', '>', '>=', '<', '<=']), right: z.string() })).min(1),
+  })).optional(),
+  where: z.union([z.array(predicateSchema), filterSchema]).optional(),
+  groupBy: z.array(z.string()).optional(),
+  having: filterSchema.optional(),
   orderBy: z.array(z.object({ column: z.string(), direction: z.enum(['asc', 'desc']).optional() })).optional(),
   limit: z.number().int().positive().optional(),
   offset: z.number().int().nonnegative().optional(),
@@ -136,7 +158,10 @@ server.registerTool('database_query_plan', {
   annotations: { readOnlyHint: true },
 }, async ({ profile, plan, includeSensitive, approvalToken }) => {
   try {
-    return result(await withProfile(profile, 'plan', approvalToken, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns }) => {
+    return result(await withProfile(profile, 'plan', approvalToken, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns, allowSensitive, policy }) => {
+      validateSensitiveAccess({ allowSensitive }, includeSensitive === true)
+      validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discover(db), timeoutMs))
+      validatePlanPolicy(plan as SelectPlan, policy)
       const pageSize = Math.max(1, Math.min(plan.limit ?? maxRows ?? 100, maxRows ?? 100))
       const queryResult = await executeWithTimeout(queryPlan(db, dialect, { ...plan, limit: pageSize } as SelectPlan, { maxRows, fetchExtra: true }), timeoutMs)
       const page = paginatePlan({ ...plan, limit: pageSize } as SelectPlan, queryResult.rows.length)
@@ -154,7 +179,7 @@ server.registerTool('database_explain', {
 }, async ({ profile, sql: statement, approvalToken }) => {
   try {
     return result(await withProfile(profile, 'explain', approvalToken, async ({ db, dialect, timeoutMs }) => {
-      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, safeStatement(statement))), timeoutMs)
+      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), timeoutMs)
       return { rows: queryResult.rows, rowCount: queryResult.rows.length }
     }))
   } catch (error) { return failure(error) }
@@ -167,9 +192,9 @@ server.registerTool('database_assess', {
   annotations: { readOnlyHint: true },
 }, async ({ profile, sql: statement, approvalToken }) => {
   try {
-    return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs }) => {
-      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, safeStatement(statement))), timeoutMs)
-      return { assessment: assessExplain(dialect, queryResult.rows as Array<Record<string, unknown>>), plan: queryResult.rows }
+    return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs, policy }) => {
+      const queryResult = await executeWithTimeout(query(db, makeExplainStatement(dialect, statement)), timeoutMs)
+      return { assessment: assessExplain(dialect, queryResult.rows as Array<Record<string, unknown>>, policy.maxEstimatedRows), plan: queryResult.rows }
     }))
   } catch (error) { return failure(error) }
 })

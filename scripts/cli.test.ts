@@ -43,3 +43,22 @@ test('creates a profile template through the CLI', async () => {
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('reports local readiness through the doctor command', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-doctor-'))
+  const databasePath = join(directory, 'app.db')
+  const setup = new Database(databasePath)
+  setup.exec('create table health_check (id integer)')
+  setup.close()
+  try {
+    const { stdout } = await cli(['doctor', '--config', join(directory, 'missing.json')], {
+      DB_DIALECT: 'sqlite', DATABASE_URL: `sqlite://${databasePath}`,
+    })
+    const report = JSON.parse(stdout) as { ok: boolean; checks: Array<{ name: string; ok: boolean }> }
+    assert.equal(report.ok, true)
+    assert.equal(report.checks.find((check) => check.name === 'runtime')?.ok, true)
+    assert.equal(report.checks.find((check) => check.name === 'connection-config')?.ok, true)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})

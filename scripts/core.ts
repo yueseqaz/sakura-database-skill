@@ -1,10 +1,29 @@
-export type DialectName = 'postgres' | 'mysql' | 'sqlite'
-export type QueryOperator = '=' | '!=' | '<>' | '>' | '>=' | '<' | '<=' | 'like' | 'in'
+import { createRequire } from 'node:module'
+import type { Parser as SqlParser } from 'node-sql-parser'
+
+export type DialectName = 'postgres' | 'mysql' | 'mariadb' | 'sqlite'
+export type QueryOperator = '=' | '!=' | '<>' | '>' | '>=' | '<' | '<=' | 'like' | 'in' | 'not in' | 'between' | 'is null' | 'is not null'
+export type AggregateFunction = 'count' | 'sum' | 'avg' | 'min' | 'max'
+export type FieldExpression = string | { aggregate: AggregateFunction; column?: string }
+export type SelectedColumn = string | { column?: string; aggregate?: AggregateFunction; as?: string }
+export interface QueryPredicate { column: FieldExpression; op: QueryOperator; value?: unknown }
+export type QueryFilter = QueryPredicate | { and: QueryFilter[] } | { or: QueryFilter[] }
+
+export interface SelectJoin {
+  table: string
+  as?: string
+  type?: 'inner' | 'left'
+  on: Array<{ left: string; op: '=' | '!=' | '<>' | '>' | '>=' | '<' | '<='; right: string }>
+}
 
 export interface SelectPlan {
   table: string
-  columns: string[]
-  where?: Array<{ column: string; op: QueryOperator; value: unknown }>
+  as?: string
+  columns: SelectedColumn[]
+  joins?: SelectJoin[]
+  where?: QueryPredicate[] | QueryFilter
+  groupBy?: string[]
+  having?: QueryFilter
   orderBy?: Array<{ column: string; direction?: 'asc' | 'desc' }>
   limit?: number
   offset?: number
@@ -16,6 +35,14 @@ export interface Policy {
   timeoutMs?: number
   sensitiveColumns?: string[]
   requireApproval?: boolean
+  allowSensitive?: boolean
+  allowRawSql?: boolean
+  allowedTables?: string[]
+  deniedTables?: string[]
+  allowedColumns?: Record<string, string[]>
+  deniedColumns?: Record<string, string[]>
+  requiredFilters?: Record<string, string[]>
+  maxEstimatedRows?: number
 }
 
 const DEFAULT_SENSITIVE_COLUMNS = [
@@ -23,10 +50,12 @@ const DEFAULT_SENSITIVE_COLUMNS = [
   'id_card', 'identity', 'resume', 'medical', 'birth',
 ]
 
-function identifier(value: string, dialect: DialectName = 'mysql'): string {
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error(`Unsafe identifier: ${value}`)
+function identifier(value: string, dialect: DialectName = 'mysql', allowStar = false): string {
+  if (allowStar && value === '*') return '*'
+  const parts = value.split('.')
+  if (parts.length > 2 || parts.some((part) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(part))) throw new Error(`Unsafe identifier: ${value}`)
   const quote = dialect === 'postgres' ? '"' : '`'
-  return `${quote}${value}${quote}`
+  return parts.map((part) => `${quote}${part}${quote}`).join('.')
 }
 
 export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRows'> = {}, dialect: DialectName = 'mysql') {
@@ -42,16 +71,54 @@ export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRow
     return '?'
   }
 
-  const predicates = (plan.where ?? []).map(({ column, op, value }) => {
+  const compileField = (field: FieldExpression): string => {
+    if (typeof field === 'string') return identifier(field, dialect)
+    const column = field.column ?? '*'
+    if (column === '*' && field.aggregate !== 'count') throw new Error('Only COUNT may use * as its column.')
+    return `${field.aggregate.toUpperCase()}(${identifier(column, dialect, true)})`
+  }
+  const compilePredicate = ({ column, op, value }: QueryPredicate): string => {
     const normalized = op.toLowerCase() as QueryOperator
-    if (!['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in'].includes(normalized)) {
+    if (!['=', '!=', '<>', '>', '>=', '<', '<=', 'like', 'in', 'not in', 'between', 'is null', 'is not null'].includes(normalized)) {
       throw new Error(`Unsupported operator: ${op}`)
     }
-    if (normalized === 'in') {
+    const field = compileField(column)
+    if (normalized === 'is null' || normalized === 'is not null') return `${field} ${normalized.toUpperCase()}`
+    if (normalized === 'in' || normalized === 'not in') {
       if (!Array.isArray(value) || value.length === 0) throw new Error('IN requires a non-empty array.')
-      return `${identifier(column, dialect)} in (${value.map(bind).join(', ')})`
+      return `${field} ${normalized.toUpperCase()} (${value.map(bind).join(', ')})`
     }
-    return `${identifier(column, dialect)} ${normalized.toUpperCase()} ${bind(value)}`
+    if (normalized === 'between') {
+      if (!Array.isArray(value) || value.length !== 2) throw new Error('BETWEEN requires an array with exactly two values.')
+      return `${field} BETWEEN ${bind(value[0])} AND ${bind(value[1])}`
+    }
+    return `${field} ${normalized.toUpperCase()} ${bind(value)}`
+  }
+  const compileFilter = (filter: QueryPredicate[] | QueryFilter): string => {
+    if (Array.isArray(filter)) return filter.map(compilePredicate).join(' and ')
+    if ('and' in filter || 'or' in filter) {
+      const operator = 'and' in filter ? 'and' : 'or'
+      const children = 'and' in filter ? filter.and : filter.or
+      if (children.length === 0) throw new Error(`${operator.toUpperCase()} requires at least one condition.`)
+      return `(${children.map((child) => compileFilter(child)).join(` ${operator} `)})`
+    }
+    return compilePredicate(filter)
+  }
+
+  const selectedColumns = plan.columns.map((column) => {
+    if (typeof column === 'string') return identifier(column, dialect)
+    if (!column.column && !column.aggregate) throw new Error('A selected expression requires column or aggregate.')
+    const expression = column.aggregate
+      ? compileField({ aggregate: column.aggregate, column: column.column })
+      : identifier(column.column as string, dialect)
+    return `${expression}${column.as ? ` as ${identifier(column.as, dialect)}` : ''}`
+  })
+
+  const table = `${identifier(plan.table, dialect)}${plan.as ? ` as ${identifier(plan.as, dialect)}` : ''}`
+  const joins = (plan.joins ?? []).map((join) => {
+    if (join.on.length === 0) throw new Error('JOIN requires at least one ON condition.')
+    const conditions = join.on.map((condition) => `${identifier(condition.left, dialect)} ${condition.op} ${identifier(condition.right, dialect)}`)
+    return `${join.type ?? 'inner'} join ${identifier(join.table, dialect)}${join.as ? ` as ${identifier(join.as, dialect)}` : ''} on ${conditions.join(' and ')}`
   })
 
   const orderBy = (plan.orderBy ?? []).map(({ column, direction = 'asc' }) => {
@@ -59,10 +126,13 @@ export function compileSelectPlan(plan: SelectPlan, policy: Pick<Policy, 'maxRow
     return `${identifier(column, dialect)} ${direction.toUpperCase()}`
   })
 
+  const whereClause = plan.where ? ` where ${compileFilter(plan.where)}` : ''
+  const groupByClause = plan.groupBy?.length ? ` group by ${plan.groupBy.map((column) => identifier(column, dialect)).join(', ')}` : ''
+  const havingClause = plan.having ? ` having ${compileFilter(plan.having)}` : ''
   const limitPlaceholder = bind(limit)
   const offsetClause = offset > 0 ? ` offset ${bind(offset)}` : ''
   return {
-    sql: `select ${plan.columns.map((column) => identifier(column, dialect)).join(', ')} from ${identifier(plan.table, dialect)}${predicates.length ? ` where ${predicates.join(' and ')}` : ''}${orderBy.length ? ` order by ${orderBy.join(', ')}` : ''} limit ${limitPlaceholder}${offsetClause}`,
+    sql: `select ${selectedColumns.join(', ')} from ${table}${joins.length ? ` ${joins.join(' ')}` : ''}${whereClause}${groupByClause}${havingClause}${orderBy.length ? ` order by ${orderBy.join(', ')}` : ''} limit ${limitPlaceholder}${offsetClause}`,
     parameters,
   }
 }
@@ -85,20 +155,180 @@ export function validatePolicy(policy: Policy, input: { action: string; approval
   if (policy.timeoutMs !== undefined && (!Number.isInteger(policy.timeoutMs) || policy.timeoutMs < 100 || policy.timeoutMs > 120_000)) {
     throw new Error('timeoutMs must be an integer between 100 and 120000.')
   }
+  if (policy.maxEstimatedRows !== undefined && (!Number.isInteger(policy.maxEstimatedRows) || policy.maxEstimatedRows < 1)) {
+    throw new Error('maxEstimatedRows must be a positive integer.')
+  }
 }
 
-export function safeStatement(statement: string): string {
+export function validateSensitiveAccess(policy: Pick<Policy, 'allowSensitive'>, requested: boolean): void {
+  if (requested && policy.allowSensitive !== true) {
+    throw new Error('Sensitive results require allowSensitive: true in the selected profile.')
+  }
+}
+
+export function validateRawSqlAccess(policy: Policy): void {
+  if (policy.allowRawSql === false) throw new Error('Raw SQL is disabled by the selected profile.')
+  const hasStructuredPolicy = Boolean(policy.allowedTables || policy.deniedTables || policy.allowedColumns || policy.deniedColumns || policy.requiredFilters)
+  if (hasStructuredPolicy && policy.allowRawSql !== true) {
+    throw new Error('Raw SQL must be explicitly enabled when structured table or column policies are configured.')
+  }
+}
+
+export function validatePlanPolicy(plan: SelectPlan, policy: Policy): void {
+  const aliases = new Map<string, string>([[plan.as ?? plan.table, plan.table]])
+  for (const join of plan.joins ?? []) aliases.set(join.as ?? join.table, join.table)
+  const tables = [plan.table, ...(plan.joins ?? []).map((join) => join.table)]
+  for (const table of tables) {
+    if (policy.allowedTables && !policy.allowedTables.includes(table)) throw new Error(`Table is not allowed by policy: ${table}`)
+    if (policy.deniedTables?.includes(table)) throw new Error(`Table is denied by policy: ${table}`)
+  }
+
+  const resolveReference = (reference: string): { table: string; column: string } => {
+    const parts = reference.split('.')
+    if (parts.length === 1) return { table: plan.table, column: parts[0] }
+    return { table: aliases.get(parts[0]) ?? parts[0], column: parts[1] }
+  }
+  const assertColumn = (reference: string) => {
+    if (reference === '*') return
+    const { table, column } = resolveReference(reference)
+    const allowed = policy.allowedColumns?.[table]
+    if (allowed && !allowed.includes(column)) throw new Error(`Column is not allowed by policy: ${table}.${column}`)
+    if (policy.deniedColumns?.[table]?.includes(column)) throw new Error(`Column is denied by policy: ${table}.${column}`)
+  }
+  const fieldReference = (field: FieldExpression) => typeof field === 'string' ? field : field.column ?? '*'
+  const visitFilter = (filter: QueryPredicate[] | QueryFilter, visitor: (predicate: QueryPredicate) => void) => {
+    if (Array.isArray(filter)) return filter.forEach(visitor)
+    if ('and' in filter) return filter.and.forEach((child) => visitFilter(child, visitor))
+    if ('or' in filter) return filter.or.forEach((child) => visitFilter(child, visitor))
+    visitor(filter)
+  }
+
+  for (const selected of plan.columns) assertColumn(typeof selected === 'string' ? selected : selected.column ?? '*')
+  for (const join of plan.joins ?? []) for (const condition of join.on) {
+    assertColumn(condition.left)
+    assertColumn(condition.right)
+  }
+  if (plan.where) visitFilter(plan.where, (predicate) => assertColumn(fieldReference(predicate.column)))
+  if (plan.having) visitFilter(plan.having, (predicate) => assertColumn(fieldReference(predicate.column)))
+  for (const column of plan.groupBy ?? []) assertColumn(column)
+  for (const order of plan.orderBy ?? []) assertColumn(order.column)
+
+  const guaranteedFilters = (filter: QueryPredicate[] | QueryFilter): Set<string> => {
+    if (Array.isArray(filter)) {
+      return new Set(filter.map((predicate) => {
+        const { table, column } = resolveReference(fieldReference(predicate.column))
+        return `${table}.${column}`
+      }))
+    }
+    if ('and' in filter) {
+      return new Set(filter.and.flatMap((child) => [...guaranteedFilters(child)]))
+    }
+    if ('or' in filter) {
+      const branches = filter.or.map(guaranteedFilters)
+      if (branches.length === 0) return new Set()
+      return new Set([...branches[0]].filter((entry) => branches.slice(1).every((branch) => branch.has(entry))))
+    }
+    const { table, column } = resolveReference(fieldReference(filter.column))
+    return new Set([`${table}.${column}`])
+  }
+  const filtered = plan.where ? guaranteedFilters(plan.where) : new Set<string>()
+  for (const [table, columns] of Object.entries(policy.requiredFilters ?? {})) {
+    for (const column of columns) {
+      if (tables.includes(table) && !filtered.has(`${table}.${column}`)) throw new Error(`Missing required filter: ${table}.${column}`)
+    }
+  }
+}
+
+export interface ObservedTable {
+  name: string
+  columns: Array<{ name: string }>
+}
+
+export function validatePlanSchema(plan: SelectPlan, tables: ObservedTable[]): void {
+  const aliases = new Map<string, ObservedTable>()
+  const addTable = (tableName: string, alias?: string) => {
+    const table = tables.find((entry) => entry.name === tableName)
+    if (!table) throw new Error(`Unknown table in observed schema: ${tableName}`)
+    const key = alias ?? tableName
+    if (aliases.has(key)) throw new Error(`Duplicate table alias: ${key}`)
+    aliases.set(key, table)
+  }
+  addTable(plan.table, plan.as)
+  for (const join of plan.joins ?? []) addTable(join.table, join.as)
+
+  const base = aliases.get(plan.as ?? plan.table) as ObservedTable
+  const validateColumn = (reference: string) => {
+    if (reference === '*') return
+    const parts = reference.split('.')
+    const table = parts.length === 2 ? aliases.get(parts[0]) : base
+    const column = parts.length === 2 ? parts[1] : parts[0]
+    if (!table) throw new Error(`Unknown table alias: ${parts[0]}`)
+    if (!table.columns.some((entry) => entry.name === column)) throw new Error(`Unknown column in ${table.name}: ${column}`)
+  }
+  const validateField = (field: FieldExpression) => validateColumn(typeof field === 'string' ? field : field.column ?? '*')
+  const validateFilter = (filter: QueryPredicate[] | QueryFilter) => {
+    if (Array.isArray(filter)) return filter.forEach((predicate) => validateField(predicate.column))
+    if ('and' in filter) return filter.and.forEach(validateFilter)
+    if ('or' in filter) return filter.or.forEach(validateFilter)
+    validateField(filter.column)
+  }
+
+  for (const column of plan.columns) validateField(typeof column === 'string' ? column : { aggregate: column.aggregate ?? 'count', column: column.column })
+  for (const join of plan.joins ?? []) for (const condition of join.on) {
+    validateColumn(condition.left)
+    validateColumn(condition.right)
+  }
+  if (plan.where) validateFilter(plan.where)
+  if (plan.having) validateFilter(plan.having)
+  for (const column of plan.groupBy ?? []) validateColumn(column)
+  for (const order of plan.orderBy ?? []) validateColumn(order.column)
+}
+
+const { Parser } = createRequire(import.meta.url)('node-sql-parser') as { Parser: new () => SqlParser }
+const sqlParser = new Parser()
+const parserDialect: Record<DialectName, string> = { mysql: 'MySQL', mariadb: 'MariaDB', postgres: 'Postgresql', sqlite: 'Sqlite' }
+const modifyingNodeTypes = new Set(['insert', 'update', 'delete', 'replace', 'create', 'alter', 'drop', 'truncate', 'grant', 'revoke', 'call'])
+
+function assertReadOnlyAst(value: unknown): void {
+  if (!value || typeof value !== 'object') return
+  if (Array.isArray(value)) {
+    for (const item of value) assertReadOnlyAst(item)
+    return
+  }
+  const node = value as Record<string, unknown>
+  if (typeof node.type === 'string' && modifyingNodeTypes.has(node.type.toLowerCase())) {
+    throw new Error('SQL must be read-only.')
+  }
+  if (node.type === 'select' && node.into && typeof node.into === 'object' && (node.into as Record<string, unknown>).position) {
+    throw new Error('SELECT INTO is not read-only.')
+  }
+  for (const child of Object.values(node)) assertReadOnlyAst(child)
+}
+
+export function safeStatement(statement: string, dialect: DialectName = 'mysql'): string {
   const normalized = statement.trim().replace(/;\s*$/, '')
   if (!normalized || /;/.test(normalized)) throw new Error('Provide exactly one SQL statement without an internal semicolon.')
-  if (!/^(select\b|with\b|explain\b)/i.test(normalized)) throw new Error('Only SELECT, WITH ... SELECT, and EXPLAIN statements are allowed.')
-  if (/\b(insert|update|delete|merge|replace|upsert|create|alter|drop|truncate|grant|revoke|call|execute|vacuum|attach|detach|load\s+data)\b/i.test(normalized)) {
-    throw new Error('Data-modifying or administrative SQL is not allowed.')
+  const explainMatch = normalized.match(/^explain(?:\s+query\s+plan)?\s+([\s\S]+)$/i)
+  const parsedStatement = explainMatch?.[1] ?? normalized
+  try {
+    const ast = sqlParser.astify(parsedStatement, { database: parserDialect[dialect] }) as unknown
+    if (Array.isArray(ast)) {
+      if (ast.length !== 1) throw new Error('Provide exactly one SQL statement.')
+    } else if (!ast || typeof ast !== 'object') {
+      throw new Error('SQL must be read-only.')
+    }
+    const root = (Array.isArray(ast) ? ast[0] : ast) as Record<string, unknown>
+    if (root.type !== 'select') throw new Error('SQL must be read-only.')
+    assertReadOnlyAst(root)
+  } catch (error) {
+    if (error instanceof Error && /read-only|exactly one/.test(error.message)) throw error
+    throw new Error(`Invalid or unsupported read-only SQL for ${dialect}.`)
   }
   return normalized
 }
 
 export function makeExplainStatement(dialect: DialectName, statement: string): string {
-  const readOnly = safeStatement(statement)
+  const readOnly = safeStatement(statement, dialect)
   if (/^explain\b/i.test(readOnly)) return readOnly
   return dialect === 'sqlite' ? `EXPLAIN QUERY PLAN ${readOnly}` : `EXPLAIN ${readOnly}`
 }
