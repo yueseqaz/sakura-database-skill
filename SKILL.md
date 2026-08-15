@@ -7,6 +7,8 @@ description: Use when Codex needs safe access to a local or remote MySQL databas
 
 Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language requests into a minimal `SelectPlan`, `MutationPlan`, or `SchemaPlan`. The tool does not accept raw SQL.
 
+Default to read-only unless the user explicitly requests a data write or schema change.
+
 ## Workflow
 
 1. Run `summary` to orient within a large database, then use paginated `discover --table <name> --limit <n>` and, when needed, `relations --table <name>` before querying an unfamiliar table. Continue with `--cursor <nextCursor>` when returned.
@@ -14,6 +16,8 @@ Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language re
 3. Convert the user's request into a minimal Query Plan using the observed schema. The CLI does not interpret natural language and has no raw SQL command.
 4. Run `assess --file <plan.json>` before a potentially expensive plan. Check `indexes` when it scans unexpectedly. Honor table, column, and required-filter profile policies.
 5. Return only fields needed for the task. Keep default masking enabled.
+
+Generate one `correlationId` for a user task and reuse it across discovery, preview, approval, execution, and retries. Before retrying an ambiguous operation, inspect its structured error and query the audit log by that ID. Read [`references/errors.md`](references/errors.md) for stable error-code responses.
 
 For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Preserve its `planFingerprint`. Execute only after the user approves that exact preview, using `execute: true`, the supplied approval token, and `confirmFingerprint`. If the plan or policy changes, preview again. Never invent an approval token or fingerprint.
 
@@ -40,6 +44,8 @@ sakura-db mutate --file mutation.json --profile writer
 sakura-db mutate --file mutation.json --profile writer --execute --approve TICKET-1024 --confirm <planFingerprint> --idempotency-key <task-key>
 sakura-db permissions --profile admin
 sakura-db schema --file schema.json --profile admin
+sakura-db audit list --profile admin --correlation-id <task-id>
+sakura-db audit verify --profile admin
 ```
 
 ## Profiles And Security
@@ -47,6 +53,7 @@ sakura-db schema --file schema.json --profile admin
 - Use profiles for remote or production databases. Credentials must be supplied by `urlEnv`, not committed to a profile.
 - Every mutation execution requires `--approve <ticket-or-token>` and the exact preview fingerprint through `--confirm`. Never reuse or invent approval.
 - Reuse one idempotency key for all retries of an insert. Use optional idempotency for retry-sensitive updates or deletes.
+- Inspect audit events before retrying an operation whose outcome is unclear. Never create a new idempotency key to bypass a conflict.
 - Preserve `optimisticLock` after a concurrent-modification failure; refresh the row and preview again.
 - Treat `allowedTables`, `allowedColumns`, `deniedColumns`, and `requiredFilters` as hard boundaries.
 - Use `--include-sensitive` only when the profile sets `allowSensitive: true` and the user explicitly authorizes disclosure.

@@ -20,6 +20,8 @@ export interface Profile extends Policy {
   urlEnv?: string
   sshTunnel?: SshTunnelConfig
   auditLog?: string
+  auditMaxBytes?: number
+  auditRetentionFiles?: number
 }
 
 export interface AgentConfig {
@@ -64,6 +66,8 @@ const profileSchema = z.object({
   urlEnv: z.string().min(1).optional(),
   sshTunnel: sshTunnelSchema.optional(),
   auditLog: z.string().min(1).optional(),
+  auditMaxBytes: z.number().int().min(256).optional(),
+  auditRetentionFiles: z.number().int().min(0).max(1_000).optional(),
   ...policyFields,
 }).strict()
 
@@ -102,6 +106,8 @@ export async function writeExampleConfig(path = defaultConfigPath()): Promise<vo
         maxRows: 50,
         timeoutMs: 5_000,
         requireApproval: true,
+        auditMaxBytes: 5_242_880,
+        auditRetentionFiles: 10,
         allowWrites: false,
         allowSchemaChanges: false,
         allowDrop: false,

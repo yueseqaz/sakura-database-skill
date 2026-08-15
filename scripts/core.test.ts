@@ -31,6 +31,9 @@ test('masks sensitive result fields by default', () => {
 test('requires an explicit approval token for protected profiles', () => {
   assert.throws(() => validatePolicy({ environment: 'production' }, { action: 'query', approvalToken: undefined }), /approval token/)
   assert.doesNotThrow(() => validatePolicy({ environment: 'production' }, { action: 'query', approvalToken: 'approved' }))
+  assert.throws(() => validatePolicy({ environment: 'development', requireApproval: true }, { action: 'query' }), /approval token/)
+  assert.doesNotThrow(() => validatePolicy({ environment: 'development' }, { action: 'query' }))
+  assert.doesNotThrow(() => validatePolicy({ environment: 'production', requireApproval: false }, { action: 'query' }))
 })
 
 test('validates plans against observed tables and columns', () => {

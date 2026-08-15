@@ -202,6 +202,7 @@ The CLI or MCP server validates the identifiers and operator, binds `42` as a pa
     }
   ],
   "rowCount": 1,
+  "correlationId": "task-42",
   "page": {
     "returned": 1,
     "hasMore": false
@@ -219,7 +220,7 @@ Create a profile file:
 npm run db-agent -- config init
 ```
 
-It creates `~/.config/sakura-database-skill/profiles.json`. A profile can reference a credential environment variable, set result/time limits, configure a JSONL audit log, require approval for production, and define an SSH tunnel.
+It creates `~/.config/sakura-database-skill/profiles.json`. A profile can reference a credential environment variable, set result/time limits, configure a rotating JSONL audit log, control approval requirements, and define an SSH tunnel.
 
 ```json
 {
@@ -231,6 +232,8 @@ It creates `~/.config/sakura-database-skill/profiles.json`. A profile can refere
       "maxRows": 50,
       "timeoutMs": 5000,
       "requireApproval": true,
+      "auditMaxBytes": 5242880,
+      "auditRetentionFiles": 10,
       "allowWrites": true,
       "allowDelete": false,
       "allowSchemaChanges": true,
@@ -264,7 +267,23 @@ npm run db-agent -- profile list
 npm run db-agent -- health --profile production --approve change-ticket-123
 ```
 
-Audit events are written as JSON Lines with duration, affected or returned row count, and a one-way statement fingerprint, without parameter values. Production profiles require `--approve` by default. Reads use database-side read-only sessions. Approved mutations run in a transaction and roll back on failure or limit violations.
+`requireApproval: true` requires `--approve` in every environment. `requireApproval: false` disables the general profile approval check. When omitted, production requires approval by default while development and staging do not. Mutation and schema execution still enforce their own explicit approval requirements.
+
+Audit events are JSON Lines containing a correlation ID, duration, affected or returned row count, and a one-way statement fingerprint. Parameters, result rows, credentials, and approval tokens are never recorded. Pass one `--correlation-id` across discovery, preview, and execution; the CLI and MCP server generate and return one when omitted.
+
+The active log rotates at 5 MiB by default and retains 10 history files, keeping normal disk use near 55 MiB. Override this per profile with `auditMaxBytes` and `auditRetentionFiles`:
+
+```bash
+sakura-db audit list --profile production --correlation-id task-42
+sakura-db audit list --profile production --action execute --success false --since 2026-08-01T00:00:00Z
+sakura-db audit stats --profile production
+sakura-db audit verify --profile production
+sakura-db audit rotate --profile production
+```
+
+Every new record contains a SHA-256 hash of itself and the previous record's hash. `audit verify` detects modified, inserted, reordered, or interior-deleted records within the retained chain. This is tamper-evident, not tamper-proof: a process with unrestricted shell access can rewrite both local logs and hashes, and deleting the oldest boundary or newest tail cannot be proven without an external trusted checkpoint. Stronger guarantees require an append-only remote sink or separate operating-system permissions.
+
+Protected writes record an intent before database execution. If that cannot be recorded, the database operation is not attempted. If the database succeeds but the outcome event cannot be written, the tool returns `AUDIT_OUTCOME_FAILED` with the correlation ID so an Agent checks database and audit state instead of blindly retrying. Reads use database-side read-only sessions; approved mutations run in a transaction and roll back on failure or limit violations.
 
 CLI failures and MCP tool failures share the same structured shape: `{"error":{"code":"...","message":"..."}}`. Stable codes cover profile, connection, write/delete permission, approval, fingerprint, idempotency, concurrent modification, filter, affected-row, schema, timeout, and rollback failures. Low-level database errors are sanitized before response or audit output.
 
@@ -276,7 +295,7 @@ The stdio MCP server exposes health, statistics, discovery, permissions, schema 
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
 ```
 
-Use the same profiles and policy controls as the CLI. `database_discover` accepts `limit` and `cursor`; mutation and schema tools preview by default. Schema execution requires both the exact plan and observed-state fingerprints, plus destructive and backup confirmation when requested. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect live metadata and build the smallest constrained plan. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
+Use the same profiles and policy controls as the CLI. Every tool accepts an optional `correlationId` and returns the effective value. `database_discover` accepts `limit` and `cursor`; mutation and schema tools preview by default. Schema execution requires both the exact plan and observed-state fingerprints, plus destructive and backup confirmation when requested. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect live metadata and build the smallest constrained plan. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
 
 ## Development
 

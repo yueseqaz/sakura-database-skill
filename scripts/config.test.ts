@@ -34,10 +34,13 @@ test('accepts explicit schema-change policy controls', async () => {
     await writeFile(path, JSON.stringify({ profiles: { admin: {
       dialect: 'mysql', urlEnv: 'DATABASE_URL', allowSchemaChanges: true, allowDrop: false,
       allowCreateDatabase: true, allowedDatabases: ['sandbox'], allowedTables: ['users'],
+      auditMaxBytes: 5_242_880, auditRetentionFiles: 10,
     } } }))
     const config = await loadConfig(path)
     assert.equal(config.profiles.admin.allowSchemaChanges, true)
     assert.deepEqual(config.profiles.admin.allowedDatabases, ['sandbox'])
+    assert.equal(config.profiles.admin.auditMaxBytes, 5_242_880)
+    assert.equal(config.profiles.admin.auditRetentionFiles, 10)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

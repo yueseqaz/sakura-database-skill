@@ -22,6 +22,8 @@ export type DatabaseAgentErrorCode =
   | 'SCHEMA_STATE_CHANGED'
   | 'DESTRUCTIVE_CONFIRMATION_REQUIRED'
   | 'BACKUP_CONFIRMATION_REQUIRED'
+  | 'AUDIT_WRITE_FAILED'
+  | 'AUDIT_OUTCOME_FAILED'
   | 'INVALID_REQUEST'
   | 'DATABASE_ERROR'
 
@@ -55,6 +57,8 @@ const messageMappings: Array<[RegExp, DatabaseAgentErrorCode]> = [
   [/Column is (?:denied|not allowed)/i, 'COLUMN_DENIED'],
   [/timed out/i, 'QUERY_TIMEOUT'],
   [/transaction rolled back/i, 'TRANSACTION_ROLLED_BACK'],
+  [/Could not write the audit intent/i, 'AUDIT_WRITE_FAILED'],
+  [/database operation succeeded, but its audit outcome could not be written/i, 'AUDIT_OUTCOME_FAILED'],
 ]
 
 function driverCode(error: unknown): string | undefined {

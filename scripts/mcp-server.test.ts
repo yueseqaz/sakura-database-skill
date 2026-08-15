@@ -18,6 +18,7 @@ test('MCP explain and assess accept plans instead of raw SQL', async () => {
     for (const name of ['database_explain', 'database_assess']) {
       const schema = tools.tools.find((tool) => tool.name === name)?.inputSchema as { properties?: Record<string, unknown> }
       assert.ok(schema.properties?.plan)
+      assert.ok(schema.properties?.correlationId)
       assert.equal(schema.properties?.sql, undefined)
     }
     const mutation = tools.tools.find((tool) => tool.name === 'database_mutation_plan')
@@ -73,11 +74,17 @@ test('MCP server exposes and runs database tools', { skip: !process.env.TEST_MYS
     const queryResponse = await client.callTool({ name: 'database_query_plan', arguments: {
       profile: 'local', plan: { table, columns: ['id', 'email'], orderBy: [{ column: 'id' }], limit: 100 },
     } }) as { content: Array<{ text: string }> }
-    assert.deepEqual(JSON.parse(queryResponse.content[0].text), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: true, nextOffset: 1 } })
+    const firstPage = JSON.parse(queryResponse.content[0].text) as Record<string, unknown>
+    assert.equal(typeof firstPage.correlationId, 'string')
+    delete firstPage.correlationId
+    assert.deepEqual(firstPage, { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: true, nextOffset: 1 } })
     const nextPageResponse = await client.callTool({ name: 'database_query_plan', arguments: {
       profile: 'local', plan: { table, columns: ['id', 'email'], orderBy: [{ column: 'id' }], limit: 1, offset: 1 },
     } }) as { content: Array<{ text: string }> }
-    assert.deepEqual(JSON.parse(nextPageResponse.content[0].text), { rows: [{ id: 2, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
+    const secondPage = JSON.parse(nextPageResponse.content[0].text) as Record<string, unknown>
+    assert.equal(typeof secondPage.correlationId, 'string')
+    delete secondPage.correlationId
+    assert.deepEqual(secondPage, { rows: [{ id: 2, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
   } finally {
     await client.close()
     await setup.query(`drop table if exists \`${table}\``)

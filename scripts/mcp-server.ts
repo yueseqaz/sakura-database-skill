@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomUUID } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
@@ -9,7 +10,7 @@ import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from '
 import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
-import { errorPayload } from './errors.js'
+import { DatabaseAgentError, errorPayload } from './errors.js'
 import { permissions } from './permissions.js'
 import { executeSchemaPlan, previewSchemaPlan, type SchemaPlan } from './schema-changes.js'
 
@@ -36,7 +37,13 @@ function auditedFingerprint(value: unknown): string | undefined {
   return typeof fingerprint === 'string' ? fingerprint : undefined
 }
 
-async function withProfile<T>(profileName: string, action: string, approvalToken: string | undefined, run: (input: {
+function withCorrelationId(value: unknown, correlationId: string): unknown {
+  if (Array.isArray(value)) return { correlationId, data: value }
+  if (value && typeof value === 'object') return { ...(value as Record<string, unknown>), correlationId }
+  return { correlationId, value }
+}
+
+async function withProfile<T>(profileName: string, action: string, approvalToken: string | undefined, requestedCorrelationId: string | undefined, run: (input: {
   dialect: 'mysql'
   db: ReturnType<typeof connect>
   maxRows?: number
@@ -44,7 +51,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   sensitiveColumns?: string[]
   allowSensitive?: boolean
   policy: Policy
-}) => Promise<T>): Promise<T> {
+}) => Promise<T>): Promise<unknown> {
   const config = await loadConfig(configPath)
   const resolved = resolveProfile(config, profileName)
   if (!resolved) throw new Error('An MCP request requires a configured profile.')
@@ -52,29 +59,52 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   const { dialect, url } = resolveConnection(resolved.profile)
   const tunnel = resolved.profile.sshTunnel ? await openTunnel(resolved.profile.sshTunnel) : undefined
   const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), resolved.profile.timeoutMs)
+  const correlationId = requestedCorrelationId ?? randomUUID()
+  const auditPath = resolved.profile.auditLog ?? defaultAuditPath()
+  const auditOptions = { maxBytes: resolved.profile.auditMaxBytes, retentionFiles: resolved.profile.auditRetentionFiles }
+  let operationSucceeded = false
   try {
+    if (action.startsWith('execute:')) {
+      try {
+        await writeAudit({ action, profile: profileName, dialect, correlationId, phase: 'intent' }, auditPath, auditOptions)
+      } catch {
+        throw new DatabaseAgentError('AUDIT_WRITE_FAILED', 'Could not write the audit intent; the database operation was not attempted.', { correlationId })
+      }
+    }
     const value = await run({ dialect, db, maxRows: resolved.profile.maxRows, timeoutMs: resolved.profile.timeoutMs, sensitiveColumns: resolved.profile.sensitiveColumns, allowSensitive: resolved.profile.allowSensitive, policy: resolved.profile })
-    await writeAudit({ action, profile: profileName, dialect, success: true, rowCount: auditedRowCount(value), fingerprint: auditedFingerprint(value) }, resolved.profile.auditLog ?? defaultAuditPath())
-    return value
+    operationSucceeded = true
+    try {
+      await writeAudit({ action, profile: profileName, dialect, success: true, correlationId, phase: 'outcome', rowCount: auditedRowCount(value), fingerprint: auditedFingerprint(value) }, auditPath, auditOptions)
+    } catch {
+      throw new DatabaseAgentError('AUDIT_OUTCOME_FAILED', 'The database operation succeeded, but its audit outcome could not be written. Check the database state before retrying.', { correlationId, operationStatus: 'succeeded' })
+    }
+    return withCorrelationId(value, correlationId)
   } catch (error) {
-    await writeAudit({ action, profile: profileName, dialect, success: false, error: JSON.stringify(errorPayload(error).error) }, resolved.profile.auditLog ?? defaultAuditPath())
-    throw error
+    if (!operationSucceeded) {
+      try {
+        await writeAudit({ action, profile: profileName, dialect, success: false, correlationId, phase: 'outcome', error: JSON.stringify(errorPayload(error).error) }, auditPath, auditOptions)
+      } catch { /* Preserve the database or policy error. */ }
+    }
+    if (error instanceof DatabaseAgentError && error.details?.correlationId) throw error
+    const normalized = errorPayload(error).error
+    throw new DatabaseAgentError(normalized.code, normalized.message, { ...normalized.details, correlationId })
   } finally {
     await db.destroy()
     await tunnel?.close()
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.8.2' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.9.0' })
+const requestContextSchema = { profile: z.string(), approvalToken: z.string().optional(), correlationId: z.string().min(1).optional() }
 
 server.registerTool('database_health', {
   title: 'Database health check',
   description: 'Check connectivity for a configured database profile.',
-  inputSchema: { profile: z.string(), approvalToken: z.string().optional() },
+  inputSchema: requestContextSchema,
   annotations: { readOnlyHint: true },
-}, async ({ profile, approvalToken }) => {
+}, async ({ profile, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'health', approvalToken, async ({ db, dialect, timeoutMs }) => ({
+    return result(await withProfile(profile, 'health', approvalToken, correlationId, async ({ db, dialect, timeoutMs }) => ({
       ...(await executeWithTimeout(health(db), timeoutMs)), dialect,
     })))
   } catch (error) { return failure(error) }
@@ -83,55 +113,55 @@ server.registerTool('database_health', {
 server.registerTool('database_discover', {
   title: 'Discover database schema',
   description: 'List database tables and columns. Optionally filter by table name.',
-  inputSchema: { profile: z.string(), table: z.string().optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional(), approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, table: z.string().optional(), limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, table, limit, cursor, approvalToken }) => {
+}, async ({ profile, table, limit, cursor, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'discover', approvalToken, ({ db, timeoutMs }) => executeWithTimeout(discoverPage(db, { search: table, limit, cursor }), timeoutMs)))
+    return result(await withProfile(profile, 'discover', approvalToken, correlationId, ({ db, timeoutMs }) => executeWithTimeout(discoverPage(db, { search: table, limit, cursor }), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
 server.registerTool('database_stats', {
   title: 'Database statistics',
   description: 'Return dialect-appropriate table, row, and storage estimates.',
-  inputSchema: { profile: z.string(), approvalToken: z.string().optional() },
+  inputSchema: requestContextSchema,
   annotations: { readOnlyHint: true },
-}, async ({ profile, approvalToken }) => {
+}, async ({ profile, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'stats', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(statistics(db, dialect), timeoutMs)))
+    return result(await withProfile(profile, 'stats', approvalToken, correlationId, ({ db, dialect, timeoutMs }) => executeWithTimeout(statistics(db, dialect), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
 server.registerTool('database_indexes', {
   title: 'Inspect table indexes',
   description: 'Return indexes reported by the database for one table.',
-  inputSchema: { profile: z.string(), table: z.string(), approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, table: z.string() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, table, approvalToken }) => {
+}, async ({ profile, table, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'indexes', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(indexes(db, dialect, table), timeoutMs)))
+    return result(await withProfile(profile, 'indexes', approvalToken, correlationId, ({ db, dialect, timeoutMs }) => executeWithTimeout(indexes(db, dialect, table), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
 server.registerTool('database_relations', {
   title: 'Inspect foreign-key relationships',
   description: 'Return foreign-key relationships reported by database metadata.',
-  inputSchema: { profile: z.string(), table: z.string().optional(), approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, table: z.string().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, table, approvalToken }) => {
+}, async ({ profile, table, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'relations', approvalToken, ({ db, dialect, timeoutMs }) => executeWithTimeout(relationships(db, dialect, table), timeoutMs)))
+    return result(await withProfile(profile, 'relations', approvalToken, correlationId, ({ db, dialect, timeoutMs }) => executeWithTimeout(relationships(db, dialect, table), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
 server.registerTool('database_summary', {
   title: 'Summarize database schema',
   description: 'Return compact table, column, and sensitive-field counts from observed schema metadata.',
-  inputSchema: { profile: z.string(), table: z.string().optional(), approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, table: z.string().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, table, approvalToken }) => {
+}, async ({ profile, table, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'summary', approvalToken, async ({ db, timeoutMs }) => {
+    return result(await withProfile(profile, 'summary', approvalToken, correlationId, async ({ db, timeoutMs }) => {
       const discovered = (await executeWithTimeout(discoverPage(db, { search: table }), timeoutMs)).tables
       const schema = discovered.map((entry) => ({ name: entry.name, columns: entry.columns.map((column) => ({ name: column.name, type: column.type, nullable: column.nullable })) })) as SchemaTable[]
       return summarizeSchema(schema)
@@ -222,11 +252,11 @@ const schemaPlanSchema = z.discriminatedUnion('operation', [
 server.registerTool('database_permissions', {
   title: 'Inspect database permissions',
   description: 'Report the connected MySQL account privileges and derived query, data-write, and schema-change capabilities.',
-  inputSchema: { profile: z.string(), approvalToken: z.string().optional() },
+  inputSchema: requestContextSchema,
   annotations: { readOnlyHint: true },
-}, async ({ profile, approvalToken }) => {
+}, async ({ profile, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'permissions', approvalToken, ({ db, timeoutMs }) => executeWithTimeout(permissions(db), timeoutMs)))
+    return result(await withProfile(profile, 'permissions', approvalToken, correlationId, ({ db, timeoutMs }) => executeWithTimeout(permissions(db), timeoutMs)))
   } catch (error) { return failure(error) }
 })
 
@@ -234,13 +264,13 @@ server.registerTool('database_schema_plan', {
   title: 'Preview or execute a controlled schema change',
   description: 'Preview a structured database/table DDL plan with permissions, dependencies, risk, recovery metadata, and state fingerprint. Execution requires exact approval confirmations.',
   inputSchema: {
-    profile: z.string(), plan: schemaPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(),
+    ...requestContextSchema, plan: schemaPlanSchema, execute: z.boolean().optional(),
     confirmFingerprint: z.string().optional(), confirmSchemaState: z.string().optional(), destructiveConfirmation: z.string().optional(), backupReference: z.string().optional(),
   },
   annotations: { readOnlyHint: false, destructiveHint: true },
-}, async ({ profile, plan, execute, approvalToken, confirmFingerprint, confirmSchemaState, destructiveConfirmation, backupReference }) => {
+}, async ({ profile, plan, execute, approvalToken, correlationId, confirmFingerprint, confirmSchemaState, destructiveConfirmation, backupReference }) => {
   try {
-    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:schema:${plan.operation}`, approvalToken, async ({ db, timeoutMs, policy }) => {
+    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:schema:${plan.operation}`, approvalToken, correlationId, async ({ db, timeoutMs, policy }) => {
       if (execute === true) return executeSchemaPlan(db, plan as SchemaPlan, policy, {
         approvalToken, confirmFingerprint, confirmSchemaState, destructiveConfirmation, backupReference, profileName: profile,
       })
@@ -252,11 +282,11 @@ server.registerTool('database_schema_plan', {
 server.registerTool('database_query_plan', {
   title: 'Run a safe database query plan',
   description: 'Execute a parameterized read-only SelectPlan. Results are masked by default.',
-  inputSchema: { profile: z.string(), plan: planSchema, includeSensitive: z.boolean().optional(), approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, plan: planSchema, includeSensitive: z.boolean().optional() },
   annotations: { readOnlyHint: true },
-}, async ({ profile, plan, includeSensitive, approvalToken }) => {
+}, async ({ profile, plan, includeSensitive, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'plan', approvalToken, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns, allowSensitive, policy }) => {
+    return result(await withProfile(profile, 'plan', approvalToken, correlationId, async ({ db, dialect, maxRows, timeoutMs, sensitiveColumns, allowSensitive, policy }) => {
       validateSensitiveAccess({ allowSensitive }, includeSensitive === true)
       validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
@@ -272,11 +302,11 @@ server.registerTool('database_query_plan', {
 server.registerTool('database_mutation_plan', {
   title: 'Preview or execute a safe mutation plan',
   description: 'Preview a structured InsertPlan, UpdatePlan, or DeletePlan by default. Execution requires profile write permission and an approval token.',
-  inputSchema: { profile: z.string(), plan: mutationPlanSchema, execute: z.boolean().optional(), approvalToken: z.string().optional(), confirmFingerprint: z.string().optional(), idempotencyKey: z.string().optional() },
+  inputSchema: { ...requestContextSchema, plan: mutationPlanSchema, execute: z.boolean().optional(), confirmFingerprint: z.string().optional(), idempotencyKey: z.string().optional() },
   annotations: { readOnlyHint: false, destructiveHint: true },
-}, async ({ profile, plan, execute, approvalToken, confirmFingerprint, idempotencyKey }) => {
+}, async ({ profile, plan, execute, approvalToken, correlationId, confirmFingerprint, idempotencyKey }) => {
   try {
-    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`, approvalToken, async ({ db, timeoutMs, policy }) => {
+    return result(await withProfile(profile, `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`, approvalToken, correlationId, async ({ db, timeoutMs, policy }) => {
       validateMutationExecution(policy, execute === true, approvalToken, confirmFingerprint, mutationPlanFingerprint(profile, plan as MutationPlan, policy))
       validateMutationSchema(plan as MutationPlan, await executeWithTimeout(discoverTables(db, [plan.table]), timeoutMs))
       if (execute === true) {
@@ -293,11 +323,11 @@ server.registerTool('database_mutation_plan', {
 server.registerTool('database_explain', {
   title: 'Explain a query plan',
   description: 'Return the MySQL execution plan for one validated SelectPlan.',
-  inputSchema: { profile: z.string(), plan: planSchema, approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, plan: planSchema },
   annotations: { readOnlyHint: true },
-}, async ({ profile, plan, approvalToken }) => {
+}, async ({ profile, plan, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'explain', approvalToken, async ({ db, timeoutMs, policy }) => {
+    return result(await withProfile(profile, 'explain', approvalToken, correlationId, async ({ db, timeoutMs, policy }) => {
       validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
       const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)
@@ -309,11 +339,11 @@ server.registerTool('database_explain', {
 server.registerTool('database_assess', {
   title: 'Assess query plan cost',
   description: 'Explain a validated SelectPlan and return a low, medium, or high risk assessment.',
-  inputSchema: { profile: z.string(), plan: planSchema, approvalToken: z.string().optional() },
+  inputSchema: { ...requestContextSchema, plan: planSchema },
   annotations: { readOnlyHint: true },
-}, async ({ profile, plan, approvalToken }) => {
+}, async ({ profile, plan, approvalToken, correlationId }) => {
   try {
-    return result(await withProfile(profile, 'assess', approvalToken, async ({ db, dialect, timeoutMs, policy }) => {
+    return result(await withProfile(profile, 'assess', approvalToken, correlationId, async ({ db, dialect, timeoutMs, policy }) => {
       validatePlanSchema(plan as SelectPlan, await executeWithTimeout(discoverTables(db, [plan.table, ...(plan.joins ?? []).map((join) => join.table)]), timeoutMs))
       validatePlanPolicy(plan as SelectPlan, policy)
       const queryResult = await executeWithTimeout(explainPlan(db, plan as SelectPlan, policy), timeoutMs)

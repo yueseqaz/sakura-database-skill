@@ -154,8 +154,9 @@ export function maskRows(rows: ReadonlyArray<Record<string, unknown>>, sensitive
 }
 
 export function validatePolicy(policy: Policy, input: { action: string; approvalToken?: string }): void {
-  if (policy.environment === 'production' && policy.requireApproval !== false && !input.approvalToken) {
-    throw new Error(`An approval token is required for ${input.action} against a production profile.`)
+  const approvalRequired = policy.requireApproval === true || (policy.environment === 'production' && policy.requireApproval !== false)
+  if (approvalRequired && !input.approvalToken) {
+    throw new Error(`An approval token is required for ${input.action} against this profile.`)
   }
   if (policy.maxRows !== undefined && (!Number.isInteger(policy.maxRows) || policy.maxRows < 1 || policy.maxRows > 10_000)) {
     throw new Error('maxRows must be an integer between 1 and 10000.')

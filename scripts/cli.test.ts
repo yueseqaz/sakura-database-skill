@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { createPool, type RowDataPacket } from 'mysql2/promise'
+import { writeAudit } from './audit.js'
 
 const execFileAsync = promisify(execFile)
 const root = new URL('..', import.meta.url).pathname
@@ -25,7 +26,10 @@ test('runs a plan through the CLI, masks results, and emits an audit event', { s
   await writeFile(planPath, JSON.stringify({ table, columns: ['id', 'email'], where: [{ column: 'status', op: '=', value: 'active' }] }))
   try {
     const { stdout } = await cli(['plan', '--file', planPath, '--audit-log', auditPath], { DATABASE_URL: process.env.TEST_MYSQL_URL })
-    assert.deepEqual(JSON.parse(stdout), { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
+    const response = JSON.parse(stdout) as Record<string, unknown>
+    assert.equal(typeof response.correlationId, 'string')
+    delete response.correlationId
+    assert.deepEqual(response, { rows: [{ id: 1, email: '[REDACTED]' }], rowCount: 1, page: { returned: 1, hasMore: false } })
     assert.match(await readFile(auditPath, 'utf8'), new RegExp(`plan:${table}`))
   } finally {
     await setup.query(`drop table if exists \`${table}\``)
@@ -118,6 +122,26 @@ test('creates a profile template through the CLI', async () => {
     const production = JSON.parse(await readFile(configPath, 'utf8')).profiles.production
     assert.ok(production)
     assert.equal(production.allowWrites, false)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('queries, verifies, reports, and rotates audit logs without a database connection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-audit-cli-'))
+  const auditPath = join(directory, 'audit.jsonl')
+  try {
+    await writeAudit({ action: 'discover', profile: 'development', success: true, correlationId: 'task-42' }, auditPath)
+    await writeAudit({ action: 'plan:users', profile: 'development', success: false, correlationId: 'task-42' }, auditPath)
+    const listed = JSON.parse((await cli(['audit', 'list', '--audit-log', auditPath, '--correlation-id', 'task-42'], {})).stdout) as { count: number }
+    assert.equal(listed.count, 2)
+    const verified = JSON.parse((await cli(['audit', 'verify', '--audit-log', auditPath], {})).stdout) as { valid: boolean }
+    assert.equal(verified.valid, true)
+    const stats = JSON.parse((await cli(['audit', 'stats', '--audit-log', auditPath], {})).stdout) as { recordCount: number; totalBytes: number }
+    assert.equal(stats.recordCount, 2)
+    assert.ok(stats.totalBytes > 0)
+    const rotated = JSON.parse((await cli(['audit', 'rotate', '--audit-log', auditPath], {})).stdout) as { rotated: boolean }
+    assert.equal(rotated.rotated, true)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

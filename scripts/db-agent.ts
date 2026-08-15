@@ -1,20 +1,21 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { compileSelectPlan, maskRows, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
-import { defaultAuditPath, fingerprintStatement, writeAudit } from './audit.js'
+import { auditStats, defaultAuditPath, fingerprintStatement, listAudit, rotateAudit, verifyAudit, writeAudit } from './audit.js'
 import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
 import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 import { doctor } from './doctor.js'
 import { compileMutationPlan, executeMutation, mutationPlanFingerprint, previewMutation, validateMutationExecution, validateMutationSchema, type MutationPlan } from './mutations.js'
-import { errorPayload } from './errors.js'
+import { DatabaseAgentError, errorPayload } from './errors.js'
 import { permissions } from './permissions.js'
 import { compileSchemaPlan, executeSchemaPlan, previewSchemaPlan, type SchemaPlan } from './schema-changes.js'
 
-type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'schema' | 'permissions' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor'
+type Command = 'discover' | 'summary' | 'assess' | 'plan' | 'mutate' | 'schema' | 'permissions' | 'explain' | 'health' | 'stats' | 'indexes' | 'relations' | 'profile' | 'config' | 'doctor' | 'audit'
 type OutputFormat = 'json' | 'table' | 'csv'
 
 interface Args {
@@ -44,7 +45,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
   const help = command === '--help' || command === '-h' || values.help === true
-  if (command && !['discover', 'summary', 'assess', 'plan', 'mutate', 'schema', 'permissions', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', '--help', '-h'].includes(command)) {
+  if (command && !['discover', 'summary', 'assess', 'plan', 'mutate', 'schema', 'permissions', 'explain', 'health', 'stats', 'indexes', 'relations', 'profile', 'config', 'doctor', 'audit', '--help', '-h'].includes(command)) {
     throw new Error(`Unknown command: ${command}`)
   }
   return { command: command as Command | undefined, values, positionals, help }
@@ -72,9 +73,15 @@ Configuration:
   config init [--config path]    Create an example profile configuration.
   profile list|show <name>        Inspect configured profiles.
 
+Auditing:
+  audit list                     Query retained audit events.
+  audit stats                    Show retained files, records, and disk usage.
+  audit verify                   Verify hash-chain and rotation continuity.
+  audit rotate                   Rotate the current log immediately.
+
 Mutation execution: mutate --file <plan.json> --profile name --execute --approve token --confirm fingerprint [--idempotency-key key]
 Schema execution: schema --file <plan.json> --profile name --execute --approve token --confirm fingerprint --confirm-state fingerprint [--confirm-destructive phrase --backup-reference id]
-Common options: --profile name --config path --approve token --format json|table|csv
+Common options: --profile name --config path --approve token --correlation-id id --format json|table|csv
 Environment: DATABASE_URL=mysql://user:password@host:3306/database`)
 }
 
@@ -100,6 +107,12 @@ function output(value: unknown, format: OutputFormat = 'json'): void {
     return
   }
   console.log(JSON.stringify(value, (_, item) => typeof item === 'bigint' ? item.toString() : item, 2))
+}
+
+function withCorrelationId(value: unknown, correlationId: string): unknown {
+  if (Array.isArray(value)) return { correlationId, data: value }
+  if (value && typeof value === 'object') return { ...(value as Record<string, unknown>), correlationId }
+  return { correlationId, value }
 }
 
 function schemaTables(entries: Awaited<ReturnType<typeof discoverTables>>): SchemaTable[] {
@@ -133,6 +146,35 @@ async function run(): Promise<void> {
     throw new Error('Use: db-agent profile list | profile show --name <name>')
   }
 
+  if (args.command === 'audit') {
+    const resolved = resolveProfile(config, stringValue(args.values, 'profile'))
+    const path = stringValue(args.values, 'audit-log') ?? resolved?.profile.auditLog ?? defaultAuditPath()
+    const subcommand = args.positionals[0]
+    if (subcommand === 'list') {
+      const successValue = args.values.success
+      if (typeof successValue === 'string' && !['true', 'false'].includes(successValue)) throw new Error('--success must be true or false.')
+      const records = await listAudit(path, {
+        profile: resolved?.name,
+        correlationId: stringValue(args.values, 'correlation-id'),
+        action: stringValue(args.values, 'action'),
+        success: successValue === true ? true : typeof successValue === 'string' ? successValue === 'true' : undefined,
+        since: stringValue(args.values, 'since'),
+        until: stringValue(args.values, 'until'),
+        limit: Number(stringValue(args.values, 'limit') ?? 100),
+      })
+      return output({ records, count: records.length })
+    }
+    if (subcommand === 'stats') return output(await auditStats(path))
+    if (subcommand === 'verify') {
+      const verification = await verifyAudit(path)
+      output(verification)
+      if (!verification.valid) process.exitCode = 1
+      return
+    }
+    if (subcommand === 'rotate') return output({ rotated: await rotateAudit(path, { retentionFiles: resolved?.profile.auditRetentionFiles }), path })
+    throw new Error('Use: db-agent audit list|stats|verify|rotate [--profile name | --audit-log path]')
+  }
+
   const resolvedProfile = resolveProfile(config, stringValue(args.values, 'profile'))
   const profile: Profile = resolvedProfile?.profile ?? { dialect: 'mysql' }
 
@@ -143,10 +185,13 @@ async function run(): Promise<void> {
   const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), profile.timeoutMs)
   const format = (stringValue(args.values, 'format') ?? 'json') as OutputFormat
   const auditPath = profile.auditLog ?? stringValue(args.values, 'audit-log') ?? defaultAuditPath()
+  const auditOptions = { maxBytes: profile.auditMaxBytes, retentionFiles: profile.auditRetentionFiles }
+  const correlationId = stringValue(args.values, 'correlation-id') ?? randomUUID()
   let action: string = args.command
   let rowCount: number | undefined
   let fingerprint: string | undefined
   const startedAt = Date.now()
+  let operationSucceeded = false
   try {
     let result: unknown
     if (args.command === 'health') result = { ...(await executeWithTimeout(health(db), profile.timeoutMs)), dialect }
@@ -176,6 +221,11 @@ async function run(): Promise<void> {
       fingerprint = fingerprintStatement(compiled.sql)
       action = `${execute ? 'execute' : 'preview'}:schema:${plan.operation}:${compiled.target}`
       if (execute) {
+        try {
+          await writeAudit({ action, profile: resolvedProfile?.name, dialect, correlationId, phase: 'intent', fingerprint }, auditPath, auditOptions)
+        } catch {
+          throw new DatabaseAgentError('AUDIT_WRITE_FAILED', 'Could not write the audit intent; the database operation was not attempted.', { correlationId })
+        }
         result = await executeSchemaPlan(db, plan, profile, {
           approvalToken,
           profileName,
@@ -203,6 +253,11 @@ async function run(): Promise<void> {
       fingerprint = fingerprintStatement(compiled.sql)
       action = `${execute ? 'execute' : 'preview'}:${plan.operation}:${plan.table}`
       if (execute) {
+        try {
+          await writeAudit({ action, profile: resolvedProfile?.name, dialect, correlationId, phase: 'intent', fingerprint }, auditPath, auditOptions)
+        } catch {
+          throw new DatabaseAgentError('AUDIT_WRITE_FAILED', 'Could not write the audit intent; the database operation was not attempted.', { correlationId })
+        }
         const mutation = await executeWithTimeout(executeMutation(db, plan, profile, {
           approvalToken, confirmFingerprint, profileName, idempotencyKey,
         }), profile.timeoutMs)
@@ -240,11 +295,22 @@ async function run(): Promise<void> {
           : { rows: explained.rows, rowCount }
       }
     }
-    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath)
-    output(result, format)
+    operationSucceeded = true
+    try {
+      await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: true, correlationId, phase: 'outcome', rowCount, fingerprint, durationMs: Date.now() - startedAt }, auditPath, auditOptions)
+    } catch {
+      throw new DatabaseAgentError('AUDIT_OUTCOME_FAILED', 'The database operation succeeded, but its audit outcome could not be written. Check the database state before retrying.', { correlationId, operationStatus: 'succeeded' })
+    }
+    output(withCorrelationId(result, correlationId), format)
   } catch (error) {
-    await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, error: JSON.stringify(errorPayload(error).error), fingerprint, durationMs: Date.now() - startedAt }, auditPath)
-    throw error
+    if (!operationSucceeded) {
+      try {
+        await writeAudit({ action, profile: resolvedProfile?.name, dialect, success: false, correlationId, phase: 'outcome', error: JSON.stringify(errorPayload(error).error), fingerprint, durationMs: Date.now() - startedAt }, auditPath, auditOptions)
+      } catch { /* Preserve the database or policy error. */ }
+    }
+    if (error instanceof DatabaseAgentError && error.details?.correlationId) throw error
+    const normalized = errorPayload(error).error
+    throw new DatabaseAgentError(normalized.code, normalized.message, { ...normalized.details, correlationId })
   } finally {
     await db.destroy()
     await tunnel?.close()

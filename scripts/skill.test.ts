@@ -13,3 +13,15 @@ test('skill teaches the controlled schema-change workflow', async () => {
   assert.match(skill, /sakura-db-mcp/)
   assert.doesNotMatch(skill, /npm run db-agent/)
 })
+
+test('skill defaults to read-only and teaches safe audit-aware retries', async () => {
+  const skill = await readFile(new URL('../SKILL.md', import.meta.url), 'utf8')
+  const errors = await readFile(new URL('../references/errors.md', import.meta.url), 'utf8')
+  assert.match(skill, /default to read-only unless the user explicitly requests/i)
+  assert.match(skill, /correlationId/i)
+  assert.match(skill, /audit.*before retrying/i)
+  assert.match(skill, /references\/errors\.md/i)
+  for (const code of ['DROP_NOT_ALLOWED', 'CONCURRENT_MODIFICATION', 'IDEMPOTENCY_CONFLICT', 'AUDIT_OUTCOME_FAILED']) {
+    assert.match(errors, new RegExp(code))
+  }
+})
