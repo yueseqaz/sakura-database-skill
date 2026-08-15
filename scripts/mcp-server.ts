@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { defaultAuditPath, writeAudit } from './audit.js'
+import { auditStats, defaultAuditPath, listAudit, verifyAudit, writeAudit } from './audit.js'
 import { loadConfig, resolveConnection, resolveProfile } from './config.js'
 import { maskRows, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
@@ -20,8 +20,8 @@ function result(value: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }] }
 }
 
-function failure(error: unknown) {
-  return { content: [{ type: 'text' as const, text: JSON.stringify(errorPayload(error), null, 2) }], isError: true }
+function failure(error: unknown, correlationId?: string) {
+  return { content: [{ type: 'text' as const, text: JSON.stringify(errorPayload(error, correlationId), null, 2) }], isError: true }
 }
 
 function auditedRowCount(value: unknown): number | undefined {
@@ -52,18 +52,26 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   allowSensitive?: boolean
   policy: Policy
 }) => Promise<T>): Promise<unknown> {
-  const config = await loadConfig(configPath)
-  const resolved = resolveProfile(config, profileName)
-  if (!resolved) throw new Error('An MCP request requires a configured profile.')
-  validatePolicy(resolved.profile, { action, approvalToken })
-  const { dialect, url } = resolveConnection(resolved.profile)
-  const tunnel = resolved.profile.sshTunnel ? await openTunnel(resolved.profile.sshTunnel) : undefined
-  const db = connect(dialect, withLocalTunnel(url, tunnel?.localPort), resolved.profile.timeoutMs)
   const correlationId = requestedCorrelationId ?? randomUUID()
-  const auditPath = resolved.profile.auditLog ?? defaultAuditPath()
-  const auditOptions = { maxBytes: resolved.profile.auditMaxBytes, retentionFiles: resolved.profile.auditRetentionFiles }
+  let auditPath = defaultAuditPath()
+  let auditOptions: { maxBytes?: number; retentionFiles?: number } = {}
+  let auditReady = false
+  let dialect: 'mysql' = 'mysql'
+  let db: ReturnType<typeof connect> | undefined
+  let tunnel: Awaited<ReturnType<typeof openTunnel>> | undefined
   let operationSucceeded = false
   try {
+    const config = await loadConfig(configPath)
+    const resolved = resolveProfile(config, profileName)
+    if (!resolved) throw new Error('An MCP request requires a configured profile.')
+    auditPath = resolved.profile.auditLog ?? defaultAuditPath()
+    auditOptions = { maxBytes: resolved.profile.auditMaxBytes, retentionFiles: resolved.profile.auditRetentionFiles }
+    auditReady = true
+    validatePolicy(resolved.profile, { action, approvalToken })
+    const connection = resolveConnection(resolved.profile)
+    dialect = connection.dialect
+    tunnel = resolved.profile.sshTunnel ? await openTunnel(resolved.profile.sshTunnel) : undefined
+    db = connect(dialect, withLocalTunnel(connection.url, tunnel?.localPort), resolved.profile.timeoutMs)
     if (action.startsWith('execute:')) {
       try {
         await writeAudit({ action, profile: profileName, dialect, correlationId, phase: 'intent' }, auditPath, auditOptions)
@@ -80,22 +88,69 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
     }
     return withCorrelationId(value, correlationId)
   } catch (error) {
-    if (!operationSucceeded) {
+    if (!operationSucceeded && auditReady) {
       try {
         await writeAudit({ action, profile: profileName, dialect, success: false, correlationId, phase: 'outcome', error: JSON.stringify(errorPayload(error).error) }, auditPath, auditOptions)
       } catch { /* Preserve the database or policy error. */ }
     }
     if (error instanceof DatabaseAgentError && error.details?.correlationId) throw error
-    const normalized = errorPayload(error).error
+    const normalized = errorPayload(error, correlationId).error
     throw new DatabaseAgentError(normalized.code, normalized.message, { ...normalized.details, correlationId })
   } finally {
-    await db.destroy()
+    await db?.destroy()
     await tunnel?.close()
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.9.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.10.0' })
 const requestContextSchema = { profile: z.string(), approvalToken: z.string().optional(), correlationId: z.string().min(1).optional() }
+
+async function auditPathForProfile(profileName: string): Promise<string> {
+  const config = await loadConfig(configPath)
+  const resolved = resolveProfile(config, profileName)
+  if (!resolved) throw new Error('An MCP request requires a configured profile.')
+  return resolved.profile.auditLog ?? defaultAuditPath()
+}
+
+server.registerTool('database_audit_list', {
+  title: 'Query database audit events',
+  description: 'Return retained audit events for a profile using machine-readable filters. Does not open a database connection.',
+  inputSchema: {
+    profile: z.string(),
+    correlationId: z.string().min(1).optional(),
+    action: z.string().min(1).optional(),
+    success: z.boolean().optional(),
+    since: z.string().optional(),
+    until: z.string().optional(),
+    limit: z.number().int().min(1).max(10_000).optional(),
+  },
+  annotations: { readOnlyHint: true },
+}, async ({ profile, correlationId, action, success, since, until, limit }) => {
+  try {
+    const records = await listAudit(await auditPathForProfile(profile), { profile, correlationId, action, success, since, until, limit })
+    return result({ records, count: records.length })
+  } catch (error) { return failure(error, correlationId ?? randomUUID()) }
+})
+
+server.registerTool('database_audit_verify', {
+  title: 'Verify database audit integrity',
+  description: 'Verify the retained audit hash chain and rotation continuity without opening a database connection.',
+  inputSchema: { profile: z.string() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile }) => {
+  try { return result(await verifyAudit(await auditPathForProfile(profile))) }
+  catch (error) { return failure(error, randomUUID()) }
+})
+
+server.registerTool('database_audit_stats', {
+  title: 'Inspect database audit storage',
+  description: 'Return retained audit file, record, and byte counts without opening a database connection.',
+  inputSchema: { profile: z.string() },
+  annotations: { readOnlyHint: true },
+}, async ({ profile }) => {
+  try { return result(await auditStats(await auditPathForProfile(profile))) }
+  catch (error) { return failure(error, randomUUID()) }
+})
 
 server.registerTool('database_health', {
   title: 'Database health check',

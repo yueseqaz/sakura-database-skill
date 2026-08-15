@@ -166,7 +166,10 @@ test('rejects the removed raw SQL command', async () => {
   await assert.rejects(() => cli(['query', '--sql', 'select 1'], {}), (error: unknown) => {
     if (!(error instanceof Error)) return false
     const payload = JSON.parse((error as Error & { stderr?: string }).stderr ?? '{}') as { error?: { code?: string; message?: string } }
-    return payload.error?.code === 'INVALID_REQUEST' && payload.error.message === 'Unknown command: query'
+    return payload.error?.code === 'INVALID_REQUEST'
+      && payload.error.message === 'Unknown command: query'
+      && typeof (payload.error as Record<string, unknown>).correlationId === 'string'
+      && (payload.error as Record<string, unknown>).requiredAction === 'FIX_PLAN'
   })
 })
 

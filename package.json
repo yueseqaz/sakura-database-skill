@@ -1,6 +1,6 @@
 {
   "name": "sakura-database-skill",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "A universal database skill and TypeScript CLI for AI agents.",
   "private": false,
   "type": "module",

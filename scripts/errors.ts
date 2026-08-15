@@ -27,6 +27,53 @@ export type DatabaseAgentErrorCode =
   | 'INVALID_REQUEST'
   | 'DATABASE_ERROR'
 
+export type RequiredAction =
+  | 'STOP'
+  | 'REQUEST_APPROVAL'
+  | 'NARROW_FILTER'
+  | 'REDISCOVER_SCHEMA'
+  | 'REDISCOVER_AND_PREVIEW'
+  | 'CHECK_AUDIT_BEFORE_RETRY'
+  | 'FIX_PROFILE'
+  | 'CHECK_PERMISSIONS'
+  | 'FIX_PLAN'
+  | 'RETRY_SAME_OPERATION'
+
+interface RecoveryInstruction {
+  retryable: boolean
+  requiredAction: RequiredAction
+}
+
+const recoveryInstructions: Record<DatabaseAgentErrorCode, RecoveryInstruction> = {
+  PROFILE_NOT_FOUND: { retryable: true, requiredAction: 'FIX_PROFILE' },
+  CONNECTION_FAILED: { retryable: true, requiredAction: 'FIX_PROFILE' },
+  WRITE_NOT_ALLOWED: { retryable: false, requiredAction: 'STOP' },
+  DELETE_NOT_ALLOWED: { retryable: false, requiredAction: 'STOP' },
+  APPROVAL_REQUIRED: { retryable: true, requiredAction: 'REQUEST_APPROVAL' },
+  PLAN_FINGERPRINT_MISMATCH: { retryable: true, requiredAction: 'REDISCOVER_AND_PREVIEW' },
+  FILTER_REQUIRED: { retryable: true, requiredAction: 'FIX_PLAN' },
+  AFFECTED_ROWS_EXCEEDED: { retryable: true, requiredAction: 'NARROW_FILTER' },
+  TABLE_NOT_FOUND: { retryable: true, requiredAction: 'REDISCOVER_SCHEMA' },
+  COLUMN_NOT_FOUND: { retryable: true, requiredAction: 'REDISCOVER_SCHEMA' },
+  COLUMN_DENIED: { retryable: false, requiredAction: 'STOP' },
+  QUERY_TIMEOUT: { retryable: true, requiredAction: 'NARROW_FILTER' },
+  TRANSACTION_ROLLED_BACK: { retryable: true, requiredAction: 'RETRY_SAME_OPERATION' },
+  CONCURRENT_MODIFICATION: { retryable: true, requiredAction: 'REDISCOVER_AND_PREVIEW' },
+  IDEMPOTENCY_REQUIRED: { retryable: true, requiredAction: 'FIX_PLAN' },
+  IDEMPOTENCY_CONFLICT: { retryable: false, requiredAction: 'CHECK_AUDIT_BEFORE_RETRY' },
+  SCHEMA_CHANGE_NOT_ALLOWED: { retryable: false, requiredAction: 'STOP' },
+  DROP_NOT_ALLOWED: { retryable: false, requiredAction: 'STOP' },
+  DATABASE_CREATE_NOT_ALLOWED: { retryable: false, requiredAction: 'STOP' },
+  PERMISSION_DENIED: { retryable: false, requiredAction: 'CHECK_PERMISSIONS' },
+  SCHEMA_STATE_CHANGED: { retryable: true, requiredAction: 'REDISCOVER_SCHEMA' },
+  DESTRUCTIVE_CONFIRMATION_REQUIRED: { retryable: true, requiredAction: 'REQUEST_APPROVAL' },
+  BACKUP_CONFIRMATION_REQUIRED: { retryable: true, requiredAction: 'REQUEST_APPROVAL' },
+  AUDIT_WRITE_FAILED: { retryable: true, requiredAction: 'FIX_PROFILE' },
+  AUDIT_OUTCOME_FAILED: { retryable: false, requiredAction: 'CHECK_AUDIT_BEFORE_RETRY' },
+  INVALID_REQUEST: { retryable: true, requiredAction: 'FIX_PLAN' },
+  DATABASE_ERROR: { retryable: false, requiredAction: 'CHECK_AUDIT_BEFORE_RETRY' },
+}
+
 export class DatabaseAgentError extends Error {
   constructor(public readonly code: DatabaseAgentErrorCode, message: string, public readonly details?: Record<string, unknown>) {
     super(message)
@@ -81,7 +128,25 @@ export function normalizeError(error: unknown): DatabaseAgentError {
   return new DatabaseAgentError(mapping?.[1] ?? 'INVALID_REQUEST', message)
 }
 
-export function errorPayload(error: unknown): { error: { code: DatabaseAgentErrorCode; message: string; details?: Record<string, unknown> } } {
+export function errorPayload(error: unknown, correlationId?: string): { error: {
+  code: DatabaseAgentErrorCode
+  message: string
+  correlationId?: string
+  retryable: boolean
+  requiredAction: RequiredAction
+  details?: Record<string, unknown>
+} } {
   const normalized = normalizeError(error)
-  return { error: { code: normalized.code, message: normalized.message, ...(normalized.details ? { details: normalized.details } : {}) } }
+  const details = normalized.details ? { ...normalized.details } : undefined
+  const embeddedCorrelationId = typeof details?.correlationId === 'string' ? details.correlationId : undefined
+  if (details) delete details.correlationId
+  const effectiveCorrelationId = correlationId ?? embeddedCorrelationId
+  const recovery = recoveryInstructions[normalized.code]
+  return { error: {
+    code: normalized.code,
+    message: normalized.message,
+    ...(effectiveCorrelationId ? { correlationId: effectiveCorrelationId } : {}),
+    ...recovery,
+    ...(details && Object.keys(details).length > 0 ? { details } : {}),
+  } }
 }

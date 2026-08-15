@@ -19,6 +19,8 @@ Default to read-only unless the user explicitly requests a data write or schema 
 
 Generate one `correlationId` for a user task and reuse it across discovery, preview, approval, execution, and retries. Before retrying an ambiguous operation, inspect its structured error and query the audit log by that ID. Read [`references/errors.md`](references/errors.md) for stable error-code responses.
 
+On failure, branch on `requiredAction`, not the human-readable `message`. Retry only when `retryable` is true and only after completing that action. Never weaken a profile policy to make a retry succeed.
+
 For a mutation, discover the live schema first. State the target table, changed columns, filters, estimated affected rows, and whether the action inserts, updates, or deletes. Call `database_mutation_plan` without execution first. Preserve its `planFingerprint`. Execute only after the user approves that exact preview, using `execute: true`, the supplied approval token, and `confirmFingerprint`. If the plan or policy changes, preview again. Never invent an approval token or fingerprint.
 
 For insert execution, supply a stable `idempotencyKey` derived from the user task and reuse it for every retry. Never change the key merely because a call timed out. For an update or delete that may race with another writer, include `optimisticLock` with an observed version or `updated_at` value and update the version in `set`. On `CONCURRENT_MODIFICATION`, read and preview again; never remove the lock to force the write.
@@ -66,4 +68,4 @@ sakura-db audit verify --profile admin
 
 ## MCP
 
-Run `sakura-db-mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.
+Run `sakura-db-mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. Use `database_audit_list` by `correlationId` before retrying an unclear outcome; use `database_audit_verify` and `database_audit_stats` for audit health. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.

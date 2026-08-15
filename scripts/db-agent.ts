@@ -25,6 +25,8 @@ interface Args {
   help: boolean
 }
 
+let activeCorrelationId: string | undefined
+
 function parseArgs(argv: string[]): Args {
   const [command, ...tokens] = argv
   const values: Record<string, string | boolean> = {}
@@ -120,7 +122,12 @@ function schemaTables(entries: Awaited<ReturnType<typeof discoverTables>>): Sche
 }
 
 async function run(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2))
+  const argv = process.argv.slice(2)
+  const correlationIndex = argv.indexOf('--correlation-id')
+  activeCorrelationId = correlationIndex >= 0 && argv[correlationIndex + 1] && !argv[correlationIndex + 1].startsWith('--')
+    ? argv[correlationIndex + 1]
+    : randomUUID()
+  const args = parseArgs(argv)
   if (args.help || !args.command) return usage()
   const configPath = stringValue(args.values, 'config') ?? defaultConfigPath()
 
@@ -186,7 +193,7 @@ async function run(): Promise<void> {
   const format = (stringValue(args.values, 'format') ?? 'json') as OutputFormat
   const auditPath = profile.auditLog ?? stringValue(args.values, 'audit-log') ?? defaultAuditPath()
   const auditOptions = { maxBytes: profile.auditMaxBytes, retentionFiles: profile.auditRetentionFiles }
-  const correlationId = stringValue(args.values, 'correlation-id') ?? randomUUID()
+  const correlationId = activeCorrelationId
   let action: string = args.command
   let rowCount: number | undefined
   let fingerprint: string | undefined
@@ -324,7 +331,7 @@ function isMainModule(): boolean {
 
 if (isMainModule()) {
   run().catch((error: unknown) => {
-    console.error(JSON.stringify(errorPayload(error)))
+    console.error(JSON.stringify(errorPayload(error, activeCorrelationId)))
     process.exitCode = 1
   })
 }

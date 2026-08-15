@@ -6,6 +6,7 @@ import test from 'node:test'
 import { createPool } from 'mysql2/promise'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
+import { writeAudit } from './audit.js'
 
 const root = new URL('..', import.meta.url).pathname
 
@@ -36,8 +37,38 @@ test('MCP explain and assess accept plans instead of raw SQL', async () => {
     assert.ok(schemaInput.properties?.backupReference)
     assert.equal(schema?.annotations?.destructiveHint, true)
     assert.ok(tools.tools.some((tool) => tool.name === 'database_permissions'))
+    for (const name of ['database_audit_list', 'database_audit_verify', 'database_audit_stats']) {
+      assert.equal(tools.tools.find((tool) => tool.name === name)?.annotations?.readOnlyHint, true)
+    }
   } finally {
     await client.close()
+  }
+})
+
+test('MCP queries and verifies audit logs without opening a database connection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-mcp-audit-'))
+  const configPath = join(directory, 'profiles.json')
+  const auditPath = join(directory, 'audit.jsonl')
+  await writeFile(configPath, JSON.stringify({ profiles: { audit: { dialect: 'mysql', urlEnv: 'INTENTIONALLY_MISSING_DATABASE_URL', auditLog: auditPath } } }))
+  await writeAudit({ action: 'discover', profile: 'audit', success: true, correlationId: 'task-42' }, auditPath)
+  const transport = new StdioClientTransport({ command: 'npx', args: ['tsx', 'scripts/mcp-server.ts'], cwd: root, env: { ...process.env, DB_AGENT_CONFIG: configPath }, stderr: 'pipe' })
+  const client = new Client({ name: 'database-agent-audit-test', version: '1.0.0' })
+  try {
+    await client.connect(transport)
+    const listed = await client.callTool({ name: 'database_audit_list', arguments: { profile: 'audit', correlationId: 'task-42' } }) as { content: Array<{ text: string }> }
+    assert.equal((JSON.parse(listed.content[0].text) as { count: number }).count, 1)
+    const verified = await client.callTool({ name: 'database_audit_verify', arguments: { profile: 'audit' } }) as { content: Array<{ text: string }> }
+    assert.equal((JSON.parse(verified.content[0].text) as { valid: boolean }).valid, true)
+    const stats = await client.callTool({ name: 'database_audit_stats', arguments: { profile: 'audit' } }) as { content: Array<{ text: string }> }
+    assert.equal((JSON.parse(stats.content[0].text) as { recordCount: number }).recordCount, 1)
+    const failed = await client.callTool({ name: 'database_audit_verify', arguments: { profile: 'missing' } }) as { content: Array<{ text: string }> }
+    const error = (JSON.parse(failed.content[0].text) as { error: Record<string, unknown> }).error
+    assert.equal(error.code, 'PROFILE_NOT_FOUND')
+    assert.equal(error.requiredAction, 'FIX_PROFILE')
+    assert.equal(typeof error.correlationId, 'string')
+  } finally {
+    await client.close()
+    await rm(directory, { recursive: true, force: true })
   }
 })
 
@@ -57,6 +88,9 @@ test('MCP server exposes and runs database tools', { skip: !process.env.TEST_MYS
     const tools = await client.listTools()
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
       'database_assess',
+      'database_audit_list',
+      'database_audit_stats',
+      'database_audit_verify',
       'database_discover',
       'database_explain',
       'database_health',

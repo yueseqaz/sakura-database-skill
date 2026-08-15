@@ -285,17 +285,31 @@ Every new record contains a SHA-256 hash of itself and the previous record's has
 
 Protected writes record an intent before database execution. If that cannot be recorded, the database operation is not attempted. If the database succeeds but the outcome event cannot be written, the tool returns `AUDIT_OUTCOME_FAILED` with the correlation ID so an Agent checks database and audit state instead of blindly retrying. Reads use database-side read-only sessions; approved mutations run in a transaction and roll back on failure or limit violations.
 
-CLI failures and MCP tool failures share the same structured shape: `{"error":{"code":"...","message":"..."}}`. Stable codes cover profile, connection, write/delete permission, approval, fingerprint, idempotency, concurrent modification, filter, affected-row, schema, timeout, and rollback failures. Low-level database errors are sanitized before response or audit output.
+CLI and MCP failures share one machine-actionable contract. Agents branch on `requiredAction` instead of parsing `message`; `retryable` permits a retry only after that action is complete:
+
+```json
+{
+  "error": {
+    "code": "CONCURRENT_MODIFICATION",
+    "message": "The row changed since preview.",
+    "correlationId": "task-42",
+    "retryable": true,
+    "requiredAction": "REDISCOVER_AND_PREVIEW"
+  }
+}
+```
+
+Stable actions are `STOP`, `REQUEST_APPROVAL`, `NARROW_FILTER`, `REDISCOVER_SCHEMA`, `REDISCOVER_AND_PREVIEW`, `CHECK_AUDIT_BEFORE_RETRY`, `FIX_PROFILE`, `CHECK_PERMISSIONS`, `FIX_PLAN`, and `RETRY_SAME_OPERATION`. Low-level database errors are sanitized before response or audit output.
 
 ## MCP Server
 
-The stdio MCP server exposes health, statistics, discovery, permissions, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, Schema Plans, `EXPLAIN`, and cost assessment. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts data plans; `database_schema_plan` accepts controlled DDL plans. No tool accepts raw SQL.
+The stdio MCP server exposes health, statistics, discovery, permissions, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, Schema Plans, `EXPLAIN`, cost assessment, and read-only audit inspection. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts data plans; `database_schema_plan` accepts controlled DDL plans. `database_audit_list`, `database_audit_verify`, and `database_audit_stats` work without opening a database connection. No tool accepts raw SQL.
 
 ```bash
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp
 ```
 
-Use the same profiles and policy controls as the CLI. Every tool accepts an optional `correlationId` and returns the effective value. `database_discover` accepts `limit` and `cursor`; mutation and schema tools preview by default. Schema execution requires both the exact plan and observed-state fingerprints, plus destructive and backup confirmation when requested. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect live metadata and build the smallest constrained plan. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
+Use the same profiles and policy controls as the CLI. Database-operation tools accept an optional `correlationId` and return the effective value; `database_audit_list` uses it to filter one task's retained events. `database_discover` accepts `limit` and `cursor`; mutation and schema tools preview by default. Schema execution requires both the exact plan and observed-state fingerprints, plus destructive and backup confirmation when requested. The accompanying [`SKILL.md`](SKILL.md) directs an AI agent to inspect live metadata and build the smallest constrained plan. Natural-language interpretation stays in the agent rather than being duplicated by CLI heuristics.
 
 ## Development
 
