@@ -20,7 +20,7 @@ export async function doctor(configPath: string, profileName?: string): Promise<
     checks.push({ name: 'config', ok: true, detail: `${Object.keys(config.profiles).length} profile(s) loaded` })
     const resolved = resolveProfile(config, profileName)
     try {
-      const connection = resolveConnection(resolved?.profile)
+      const connection = await resolveConnection(resolved?.profile)
       checks.push({ name: 'connection-config', ok: true, detail: `${connection.dialect} credentials are configured` })
     } catch (error) {
       checks.push({ name: 'connection-config', ok: false, detail: error instanceof Error ? error.message : String(error) })

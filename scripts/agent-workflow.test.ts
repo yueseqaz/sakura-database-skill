@@ -28,3 +28,15 @@ test('agent recovery contract covers the complete safe mutation workflow', async
 
   assert.equal(errorPayload(new Error('The row changed since preview.'), 'workflow-1').error.correlationId, 'workflow-1')
 })
+
+test('skill teaches safe project configuration discovery before database access', async () => {
+  const skill = await readFile(new URL('../SKILL.md', import.meta.url), 'utf8')
+  assert.match(skill, /config discover --project/)
+  assert.match(skill, /profile import/)
+  assert.match(skill, /preview.*candidate|candidate.*preview/i)
+  assert.match(skill, /do not copy.*credential|never copy.*password/i)
+  assert.match(skill, /read-only profile/i)
+  assert.match(skill, /projectPath/)
+  assert.match(skill, /candidateId/)
+  assert.match(skill, /profileName/)
+})

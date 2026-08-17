@@ -214,13 +214,27 @@ The order-specific interpretation belongs to the AI agent and the live schema. N
 
 ## Profiles, Auditing, And SSH
 
+### Discover Project Configuration
+
+When a repository already contains its MySQL settings, discover connection candidates before creating a profile manually:
+
+```bash
+sakura-db config discover --project /path/to/project
+sakura-db profile import --project /path/to/project --candidate <id> --name project-dev
+sakura-db doctor --profile project-dev
+```
+
+Discovery supports `.env*`, Spring `application*.properties`, and Spring `application*.yml`/`yaml`. It recognizes full `mysql://` or `jdbc:mysql://` URLs, split `DB_*`, `MYSQL_*`, or `DATABASE_*` dotenv fields, and Spring datasource URL/username/password fields. Template files such as `.env.example` are ignored.
+
+The discovery response shows only a redacted preview. Import creates a read-only profile containing the source file path and field names, not the password or connection value. The CLI resolves that source when it connects, so environment placeholders such as `${MYSQL_PASSWORD}` still come from the runtime environment. Existing profiles are never overwritten unless `--replace` is supplied explicitly. Profile writes are atomic and use mode `0600`.
+
 Create a profile file:
 
 ```bash
 npm run db-agent -- config init
 ```
 
-It creates `~/.config/sakura-database-skill/profiles.json`. A profile can reference a credential environment variable, set result/time limits, configure a rotating JSONL audit log, control approval requirements, and define an SSH tunnel.
+It creates `~/.config/sakura-database-skill/profiles.json`. A profile can reference a credential environment variable or imported project credential source, set result/time limits, configure a rotating JSONL audit log, control approval requirements, and define an SSH tunnel.
 
 ```json
 {
@@ -303,7 +317,7 @@ Stable actions are `STOP`, `REQUEST_APPROVAL`, `NARROW_FILTER`, `REDISCOVER_SCHE
 
 ## MCP Server
 
-The stdio MCP server exposes health, statistics, discovery, permissions, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, Schema Plans, `EXPLAIN`, cost assessment, and read-only audit inspection. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts data plans; `database_schema_plan` accepts controlled DDL plans. `database_audit_list`, `database_audit_verify`, and `database_audit_stats` work without opening a database connection. No tool accepts raw SQL.
+The stdio MCP server exposes project configuration discovery/import, health, statistics, schema discovery, permissions, schema summaries, indexes, foreign-key relations, Query Plans, Mutation Plans, Schema Plans, `EXPLAIN`, cost assessment, and read-only audit inspection. `database_config_discover` and `database_profile_import` provide the same redacted, read-only-by-default profile bootstrap as the CLI without opening a database connection. Query, explain, and assess tools accept SelectPlan; `database_mutation_plan` accepts data plans; `database_schema_plan` accepts controlled DDL plans. `database_audit_list`, `database_audit_verify`, and `database_audit_stats` also work without opening a database connection. No tool accepts raw SQL.
 
 ```bash
 DB_AGENT_CONFIG="/absolute/path/to/profiles.json" npm run mcp

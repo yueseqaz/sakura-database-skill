@@ -1,6 +1,6 @@
 ---
 name: database-agent
-description: Use when Codex needs safe access to a local or remote MySQL database for schema discovery, constrained queries, controlled data writes, permission inspection, or approved database and table structure changes.
+description: Use when Codex needs to find MySQL connection settings in a project or safely access a local or remote MySQL database for schema discovery, constrained queries, controlled writes, permission inspection, or approved structure changes.
 ---
 
 # Database Agent
@@ -8,6 +8,8 @@ description: Use when Codex needs safe access to a local or remote MySQL databas
 Use the TypeScript CLI or MCP server for MySQL work. Convert natural-language requests into a minimal `SelectPlan`, `MutationPlan`, or `SchemaPlan`. The tool does not accept raw SQL.
 
 Default to read-only unless the user explicitly requests a data write or schema change.
+
+When a project has database configuration but no usable profile, run `sakura-db config discover --project <path>`. Review the candidate previews with the user, then import only the selected candidate with `sakura-db profile import --project <path> --candidate <id> --name <name>`. Import creates a read-only profile that references the original project configuration. Do not copy credentials or passwords into commands, chat output, or `profiles.json`. Do not use `--replace` unless the user explicitly approves replacing that profile.
 
 ## Workflow
 
@@ -39,6 +41,8 @@ For a structure change, call `database_permissions`, then preview the structured
 ```bash
 sakura-db discover --table orders
 sakura-db summary --table orders
+sakura-db config discover --project .
+sakura-db profile import --project . --candidate <id> --name project-dev
 sakura-db plan --file plan.json --profile development
 sakura-db assess --file plan.json --profile development
 sakura-db explain --file plan.json --profile development
@@ -52,7 +56,7 @@ sakura-db audit verify --profile admin
 
 ## Profiles And Security
 
-- Use profiles for remote or production databases. Credentials must be supplied by `urlEnv`, not committed to a profile.
+- Use profiles for remote or production databases. Reference credentials through `urlEnv` or an imported `credentialSource`; do not commit credentials to a profile.
 - Every mutation execution requires `--approve <ticket-or-token>` and the exact preview fingerprint through `--confirm`. Never reuse or invent approval.
 - Reuse one idempotency key for all retries of an insert. Use optional idempotency for retry-sensitive updates or deletes.
 - Inspect audit events before retrying an operation whose outcome is unclear. Never create a new idempotency key to bypass a conflict.
@@ -68,4 +72,4 @@ sakura-db audit verify --profile admin
 
 ## MCP
 
-Run `sakura-db-mcp` for stdio integration. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. Use `database_audit_list` by `correlationId` before retrying an unclear outcome; use `database_audit_verify` and `database_audit_stats` for audit health. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.
+Run `sakura-db-mcp` for stdio integration. When no profile exists, call `database_config_discover` with `{ "projectPath": "/absolute/project/path" }`, review its redacted candidates, then call `database_profile_import` only for the selected candidate with `{ "projectPath": "/absolute/project/path", "candidateId": "<id>", "profileName": "project-dev" }`. Set `replace: true` only after explicit approval. Use `database_query_plan` for reads, `database_mutation_plan` for data writes, `database_permissions` for account capabilities, and `database_schema_plan` for DDL. Use `database_audit_list` by `correlationId` before retrying an unclear outcome; use `database_audit_verify` and `database_audit_stats` for audit health. MCP explain and assess tools require a SelectPlan. MCP and CLI share validation, policies, structured errors, approvals, masking, and audit controls.

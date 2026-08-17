@@ -5,7 +5,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { compileSelectPlan, maskRows, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { auditStats, defaultAuditPath, fingerprintStatement, listAudit, rotateAudit, verifyAudit, writeAudit } from './audit.js'
-import { defaultConfigPath, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
+import { defaultConfigPath, discoverProjectProfiles, importDiscoveredProfile, loadConfig, resolveConnection, resolveProfile, writeExampleConfig, type Profile } from './config.js'
 import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
 import { openTunnel } from './tunnel.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
@@ -73,7 +73,9 @@ Database commands:
 Configuration:
   doctor [--profile name]        Check runtime and configuration readiness.
   config init [--config path]    Create an example profile configuration.
-  profile list|show <name>        Inspect configured profiles.
+  config discover --project path Find MySQL configuration in a project without exposing credentials.
+  profile list|show <name>       Inspect configured profiles.
+  profile import                 Import one discovered candidate as a read-only profile.
 
 Auditing:
   audit list                     Query retained audit events.
@@ -138,7 +140,12 @@ async function run(): Promise<void> {
       await writeExampleConfig(configPath)
       return output({ created: configPath })
     }
-    throw new Error('Use: db-agent config init [--config path]')
+    if (args.positionals[0] === 'discover') {
+      const projectPath = stringValue(args.values, 'project') ?? process.cwd()
+      const candidates = await discoverProjectProfiles(projectPath)
+      return output({ projectPath, candidates, count: candidates.length })
+    }
+    throw new Error('Use: db-agent config init [--config path] | config discover [--project path]')
   }
 
   const config = await loadConfig(configPath)
@@ -150,7 +157,19 @@ async function run(): Promise<void> {
       const profile = resolveProfile(config, name)
       return output({ name: profile?.name, profile: { ...profile?.profile, url: undefined } })
     }
-    throw new Error('Use: db-agent profile list | profile show --name <name>')
+    if (args.positionals[0] === 'import') {
+      const candidateId = stringValue(args.values, 'candidate')
+      const profileName = stringValue(args.values, 'name')
+      if (!candidateId || !profileName) throw new Error('Use: db-agent profile import --candidate <id> --name <name> [--project path] [--replace]')
+      return output(await importDiscoveredProfile({
+        projectPath: stringValue(args.values, 'project') ?? process.cwd(),
+        candidateId,
+        profileName,
+        configPath,
+        replace: args.values.replace === true,
+      }))
+    }
+    throw new Error('Use: db-agent profile list | profile show --name <name> | profile import --candidate <id> --name <name>')
   }
 
   if (args.command === 'audit') {
@@ -185,7 +204,7 @@ async function run(): Promise<void> {
   const resolvedProfile = resolveProfile(config, stringValue(args.values, 'profile'))
   const profile: Profile = resolvedProfile?.profile ?? { dialect: 'mysql' }
 
-  const { dialect, url } = resolveConnection(resolvedProfile?.profile)
+  const { dialect, url } = await resolveConnection(resolvedProfile?.profile)
   validatePolicy(profile, { action: args.command, approvalToken: stringValue(args.values, 'approve') })
 
   const tunnel = profile.sshTunnel ? await openTunnel(profile.sshTunnel) : undefined

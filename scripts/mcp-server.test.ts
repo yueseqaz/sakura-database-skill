@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -40,6 +40,8 @@ test('MCP explain and assess accept plans instead of raw SQL', async () => {
     for (const name of ['database_audit_list', 'database_audit_verify', 'database_audit_stats']) {
       assert.equal(tools.tools.find((tool) => tool.name === name)?.annotations?.readOnlyHint, true)
     }
+    assert.equal(tools.tools.find((tool) => tool.name === 'database_config_discover')?.annotations?.readOnlyHint, true)
+    assert.equal(tools.tools.find((tool) => tool.name === 'database_profile_import')?.annotations?.destructiveHint, true)
   } finally {
     await client.close()
   }
@@ -72,6 +74,28 @@ test('MCP queries and verifies audit logs without opening a database connection'
   }
 })
 
+test('MCP discovers project configuration and imports a profile without opening a database connection', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-mcp-config-'))
+  const configPath = join(directory, 'profiles.json')
+  await writeFile(join(directory, '.env'), 'DATABASE_URL=mysql://mcp:mcp-secret@localhost:3306/mcp_demo\n')
+  const transport = new StdioClientTransport({ command: 'npx', args: ['tsx', 'scripts/mcp-server.ts'], cwd: root, env: { ...process.env, DB_AGENT_CONFIG: configPath }, stderr: 'pipe' })
+  const client = new Client({ name: 'database-agent-config-test', version: '1.0.0' })
+  try {
+    await client.connect(transport)
+    const discovered = await client.callTool({ name: 'database_config_discover', arguments: { projectPath: directory } }) as { content: Array<{ text: string }> }
+    assert.doesNotMatch(discovered.content[0].text, /mcp-secret/)
+    const candidates = (JSON.parse(discovered.content[0].text) as { candidates: Array<{ id: string }> }).candidates
+    assert.equal(candidates.length, 1)
+
+    const imported = await client.callTool({ name: 'database_profile_import', arguments: { projectPath: directory, candidateId: candidates[0].id, profileName: 'mcp-demo' } }) as { content: Array<{ text: string }> }
+    assert.equal((JSON.parse(imported.content[0].text) as { created: boolean }).created, true)
+    assert.doesNotMatch(await readFile(configPath, 'utf8'), /mcp-secret/)
+  } finally {
+    await client.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('MCP server exposes and runs database tools', { skip: !process.env.TEST_MYSQL_URL }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'database-agent-mcp-'))
   const configPath = join(directory, 'profiles.json')
@@ -91,12 +115,14 @@ test('MCP server exposes and runs database tools', { skip: !process.env.TEST_MYS
       'database_audit_list',
       'database_audit_stats',
       'database_audit_verify',
+      'database_config_discover',
       'database_discover',
       'database_explain',
       'database_health',
       'database_indexes',
       'database_mutation_plan',
       'database_permissions',
+      'database_profile_import',
       'database_query_plan',
       'database_relations',
       'database_schema_plan',

@@ -1,4 +1,4 @@
 interface:
   display_name: "Database Agent"
-  short_description: "Safe MySQL queries and controlled writes"
-  default_prompt: "Use $database-agent to inspect MySQL permissions and schema, build the smallest plan, execute it with explicit approval when required, and follow machine-readable recovery actions."
+  short_description: "Discover and safely operate MySQL databases"
+  default_prompt: "Use $database-agent to discover project MySQL configuration when needed, inspect live schema, and execute the smallest policy-controlled plan."

@@ -4,7 +4,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import { auditStats, defaultAuditPath, listAudit, verifyAudit, writeAudit } from './audit.js'
-import { loadConfig, resolveConnection, resolveProfile } from './config.js'
+import { discoverProjectProfiles, importDiscoveredProfile, loadConfig, resolveConnection, resolveProfile } from './config.js'
 import { maskRows, type Policy, type SelectPlan, validatePlanPolicy, validatePlanSchema, validatePolicy, validateSensitiveAccess } from './core.js'
 import { assessExplain, paginatePlan, summarizeSchema, type SchemaTable } from './intelligence.js'
 import { connect, discoverPage, discoverTables, executeWithTimeout, explainPlan, health, indexes, queryPlan, relationships, statistics, withLocalTunnel } from './database.js'
@@ -68,7 +68,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
     auditOptions = { maxBytes: resolved.profile.auditMaxBytes, retentionFiles: resolved.profile.auditRetentionFiles }
     auditReady = true
     validatePolicy(resolved.profile, { action, approvalToken })
-    const connection = resolveConnection(resolved.profile)
+    const connection = await resolveConnection(resolved.profile)
     dialect = connection.dialect
     tunnel = resolved.profile.sshTunnel ? await openTunnel(resolved.profile.sshTunnel) : undefined
     db = connect(dialect, withLocalTunnel(connection.url, tunnel?.localPort), resolved.profile.timeoutMs)
@@ -102,7 +102,7 @@ async function withProfile<T>(profileName: string, action: string, approvalToken
   }
 }
 
-const server = new McpServer({ name: 'sakura-database-skill', version: '0.10.0' })
+const server = new McpServer({ name: 'sakura-database-skill', version: '0.11.0' })
 const requestContextSchema = { profile: z.string(), approvalToken: z.string().optional(), correlationId: z.string().min(1).optional() }
 
 async function auditPathForProfile(profileName: string): Promise<string> {
@@ -111,6 +111,33 @@ async function auditPathForProfile(profileName: string): Promise<string> {
   if (!resolved) throw new Error('An MCP request requires a configured profile.')
   return resolved.profile.auditLog ?? defaultAuditPath()
 }
+
+server.registerTool('database_config_discover', {
+  title: 'Discover project database configuration',
+  description: 'Find supported MySQL connection settings in a project and return redacted profile candidates. Does not open a database connection or modify files.',
+  inputSchema: { projectPath: z.string().min(1) },
+  annotations: { readOnlyHint: true },
+}, async ({ projectPath }) => {
+  try {
+    const candidates = await discoverProjectProfiles(projectPath)
+    return result({ projectPath, candidates, count: candidates.length })
+  } catch (error) { return failure(error, randomUUID()) }
+})
+
+server.registerTool('database_profile_import', {
+  title: 'Import a discovered database profile',
+  description: 'Import one discovery candidate as a read-only profile. Existing profiles are preserved unless replace is explicitly true.',
+  inputSchema: {
+    projectPath: z.string().min(1),
+    candidateId: z.string().min(1),
+    profileName: z.string().min(1),
+    replace: z.boolean().optional(),
+  },
+  annotations: { readOnlyHint: false, destructiveHint: true },
+}, async ({ projectPath, candidateId, profileName, replace }) => {
+  try { return result(await importDiscoveredProfile({ projectPath, candidateId, profileName, configPath, replace })) }
+  catch (error) { return failure(error, randomUUID()) }
+})
 
 server.registerTool('database_audit_list', {
   title: 'Query database audit events',

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -122,6 +122,30 @@ test('creates a profile template through the CLI', async () => {
     const production = JSON.parse(await readFile(configPath, 'utf8')).profiles.production
     assert.ok(production)
     assert.equal(production.allowWrites, false)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('discovers project database configuration and imports a read-only profile', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'database-agent-config-discovery-'))
+  const projectPath = join(directory, 'project')
+  const configPath = join(directory, 'profiles.json')
+  try {
+    await mkdir(projectPath)
+    await writeFile(join(projectPath, '.env'), 'DATABASE_URL=mysql://agent:never-print@127.0.0.1:3306/demo\n')
+    const discovered = JSON.parse((await cli(['config', 'discover', '--project', projectPath], {})).stdout) as { candidates: Array<{ id: string; preview: string }> }
+    assert.equal(discovered.candidates.length, 1)
+    assert.doesNotMatch(JSON.stringify(discovered), /never-print/)
+
+    const imported = JSON.parse((await cli([
+      'profile', 'import', '--project', projectPath, '--candidate', discovered.candidates[0].id,
+      '--name', 'demo', '--config', configPath,
+    ], {})).stdout) as { name: string; created: boolean }
+    assert.deepEqual(imported, { name: 'demo', created: true, configPath })
+    const stored = await readFile(configPath, 'utf8')
+    assert.doesNotMatch(stored, /never-print/)
+    assert.equal(JSON.parse(stored).profiles.demo.allowWrites, false)
   } finally {
     await rm(directory, { recursive: true, force: true })
   }
